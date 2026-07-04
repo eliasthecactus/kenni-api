@@ -1,0 +1,25 @@
+# Swift / Vapor
+.build/
+.swiftpm/
+DerivedData/
+Package.resolved.lock
+
+# Environment & secrets
+.env
+.env.*
+*.p8
+*.p12
+
+# Database volumes (local dev)
+.postgres-data/
+db-data/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Local dev database
+*.sqlite
+*.sqlite-*

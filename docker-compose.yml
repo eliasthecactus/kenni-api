@@ -1,0 +1,30 @@
+# Local development stack. On Coolify, add a PostgreSQL resource and set
+# DATABASE_URL on the app instead.
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://kenni:kenni@db:5432/kenni
+      # APNS_KEY_P8, APNS_KEY_ID, APNS_TEAM_ID, APNS_TOPIC, APNS_ENV → see .env.example
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: kenni
+      POSTGRES_PASSWORD: kenni
+      POSTGRES_DB: kenni
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kenni"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  db-data:
