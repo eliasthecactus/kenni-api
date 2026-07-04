@@ -36,22 +36,32 @@ public func configure(_ app: Application) async throws {
     // at a .p8 file for local development.
     let p8FromPath = Environment.get("APNS_KEY_PATH")
         .flatMap { try? String(contentsOfFile: $0, encoding: .utf8) }
-    if let p8 = Environment.get("APNS_KEY_P8") ?? p8FromPath,
+    if let rawP8 = Environment.get("APNS_KEY_P8") ?? p8FromPath,
        let keyID = Environment.get("APNS_KEY_ID"),
        let teamID = Environment.get("APNS_TEAM_ID") {
-        let apnsConfig = APNSClientConfiguration(
-            authenticationMethod: .jwt(
-                privateKey: try .init(pemRepresentation: p8),
-                keyIdentifier: keyID,
-                teamIdentifier: teamID),
-            environment: Environment.get("APNS_ENV") == "production" ? .production : .development)
-        app.apns.containers.use(
-            apnsConfig,
-            eventLoopGroupProvider: .shared(app.eventLoopGroup),
-            responseDecoder: JSONDecoder(),
-            requestEncoder: JSONEncoder(),
-            as: .default)
-        app.logger.info("APNs configured (\(Environment.get("APNS_ENV") ?? "development"))")
+        do {
+            // Coolify (and most env-var UIs) mangle the multi-line PEM: newlines
+            // collapse to spaces or literal "\n". Rebuild a canonical PEM so
+            // CryptoKit can parse it however the newlines survived.
+            let privateKey = try P256.Signing.PrivateKey(pemRepresentation: normalizePEM(rawP8))
+            let apnsConfig = APNSClientConfiguration(
+                authenticationMethod: .jwt(
+                    privateKey: privateKey,
+                    keyIdentifier: keyID,
+                    teamIdentifier: teamID),
+                environment: Environment.get("APNS_ENV") == "production" ? .production : .development)
+            app.apns.containers.use(
+                apnsConfig,
+                eventLoopGroupProvider: .shared(app.eventLoopGroup),
+                responseDecoder: JSONDecoder(),
+                requestEncoder: JSONEncoder(),
+                as: .default)
+            app.logger.info("APNs configured (\(Environment.get("APNS_ENV") ?? "development"))")
+        } catch {
+            // A malformed key must not take the whole server down — degrade to
+            // log-only pushes, exactly like the unconfigured case.
+            app.logger.error("APNs key failed to parse (\(error)) — pushes will only be logged")
+        }
     } else {
         app.logger.warning("APNs not configured — pushes will only be logged")
     }
@@ -72,6 +82,28 @@ public func configure(_ app: Application) async throws {
     app.asyncCommands.use(PushTestCommand(), as: "push-test")
 
     try routes(app)
+}
+
+/// Reconstruct a canonical PKCS#8 PEM from a key whose newlines were flattened
+/// by an env-var UI. Handles literal `\n`, CRLF, and fully-collapsed (spaces)
+/// input by stripping the header/footer, removing all whitespace from the
+/// base64 body, then re-wrapping at 64 chars.
+func normalizePEM(_ raw: String) -> String {
+    var s = raw.replacingOccurrences(of: "\\r\\n", with: "\n")
+               .replacingOccurrences(of: "\\n", with: "\n")
+               .replacingOccurrences(of: "\r", with: "\n")
+    // If it already has real newlines and parses, we still normalize harmlessly.
+    let header = "-----BEGIN PRIVATE KEY-----"
+    let footer = "-----END PRIVATE KEY-----"
+    s = s.replacingOccurrences(of: header, with: "")
+         .replacingOccurrences(of: footer, with: "")
+    let body = s.filter { !$0.isWhitespace }
+    let wrapped = stride(from: 0, to: body.count, by: 64).map { start -> String in
+        let a = body.index(body.startIndex, offsetBy: start)
+        let b = body.index(a, offsetBy: min(64, body.count - start))
+        return String(body[a..<b])
+    }.joined(separator: "\n")
+    return "\(header)\n\(wrapped)\n\(footer)"
 }
 
 struct CancelOnShutdown: LifecycleHandler {
