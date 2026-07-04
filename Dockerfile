@@ -11,7 +11,7 @@ RUN swift build -c release --product App --static-swift-stdlib
 
 # ============ run ============
 FROM ubuntu:noble
-RUN apt-get -qq update && apt-get -qq -y install ca-certificates tzdata libcurl4 \
+RUN apt-get -qq update && apt-get -qq -y install ca-certificates tzdata libcurl4 curl \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd --system --create-home vapor
 WORKDIR /app
