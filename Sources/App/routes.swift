@@ -26,14 +26,36 @@ struct BackupDTO: Content {
     let blob: String
 }
 
-func routes(_ app: Application) throws {
+func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
+            businessLookupLimiter: RateLimiterStore) throws {
     app.get("health") { _ in
         ["status": "ok"]
     }
+    registerAdminPortal(on: app, configuration: businessConfiguration)
 
     let v1 = app.grouped("v1")
+    // Approved-business lookup deliberately requires only the business PIN. It
+    // does not receive or retain the user's identity key.
+    let businessRoutes = v1.grouped("businesses")
+        .grouped(RateLimitMiddleware(store: businessLookupLimiter))
+    businessRoutes.post("identify") { req async throws -> BusinessDTO in
+        let dto = try req.content.decode(IdentifyBusinessDTO.self)
+        guard let pin = dto.pin.normalizedBusinessPIN else {
+            throw Abort(.badRequest, reason: "PIN must contain six digits")
+        }
+        guard let digest = businessConfiguration.pinDigest(pin) else {
+            throw Abort(.serviceUnavailable, reason: "business identification is not configured")
+        }
+        guard let business = try await Business.query(on: req.db)
+            .filter(\.$pinDigest == digest)
+            .first() else {
+            throw Abort(.notFound, reason: "business not found")
+        }
+        return try BusinessDTO(business)
+    }
 
     // MARK: Devices
+
 
     v1.post("devices") { req async throws -> HTTPStatus in
         let auth = try KenniAuth.verify(req, body: req.body.data)

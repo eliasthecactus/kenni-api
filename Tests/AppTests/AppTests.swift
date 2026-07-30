@@ -7,7 +7,8 @@ final class AppTests: XCTestCase {
 
     override func setUp() async throws {
         app = try await Application.make(.testing)
-        try await configure(app)
+        try await configure(app, businessConfiguration: BusinessConfiguration(
+            adminPSK: "test-admin-key", pinSecret: "test-business-pin-secret"))
     }
 
     override func tearDown() async throws {
@@ -167,5 +168,85 @@ final class AppTests: XCTestCase {
             let backup = try? res.content.decode(BackupDTO.self)
             XCTAssertEqual(backup?.blob, "encrypted-contacts")
         }
+    }
+
+    func testAdminPortalCreatesBusinessForUnsignedPINLookup() async throws {
+        try await app.test(.GET, "admin") { res async in
+            XCTAssertEqual(res.status, .unauthorized)
+            XCTAssertEqual(res.headers.contentType?.type, "text")
+        }
+
+        var cookie: String?
+        try await app.test(.POST, "admin/login", beforeRequest: { req in
+            req.headers.replaceOrAdd(name: "Content-Type",
+                                     value: "application/x-www-form-urlencoded")
+            req.body = ByteBuffer(string: "psk=test-admin-key")
+        }) { res async in
+            XCTAssertEqual(res.status, .seeOther)
+            cookie = res.headers.first(name: "Set-Cookie")?
+                .split(separator: ";").first.map(String.init)
+        }
+        let sessionCookie = try XCTUnwrap(cookie)
+
+        var csrf: String?
+        try await app.test(.GET, "admin", beforeRequest: { req in
+            req.headers.replaceOrAdd(name: "Cookie", value: sessionCookie)
+        }) { res async in
+            XCTAssertEqual(res.status, .ok)
+            let html = res.body.string
+            let marker = #"name="csrf" value=""#
+            if let markerRange = html.range(of: marker) {
+                csrf = String(html[markerRange.upperBound...].prefix { $0 != "\"" })
+            }
+        }
+        let csrfToken = try XCTUnwrap(csrf)
+
+        try await app.test(.POST, "admin/businesses", beforeRequest: { req in
+            req.headers.replaceOrAdd(name: "Cookie", value: sessionCookie)
+            req.headers.replaceOrAdd(name: "Content-Type",
+                                     value: "application/x-www-form-urlencoded")
+            req.body = ByteBuffer(string:
+                "csrf=\(csrfToken)&name=Acme%20AG&pin=481516&logoURL=https%3A%2F%2Fexample.com%2Flogo.png&address=Main%20Street%201%0A8000%20Zurich&websiteURL=https%3A%2F%2Fexample.com")
+        }) { res async in
+            XCTAssertEqual(res.status, .seeOther)
+        }
+
+        let lookupBody = #"{"pin":"481516"}"#
+        try await app.test(.POST, "v1/businesses/identify", beforeRequest: { req in
+            req.headers.contentType = .json
+            req.body = ByteBuffer(string: lookupBody)
+        }) { res async in
+            XCTAssertEqual(res.status, .ok)
+            let business = try? res.content.decode(BusinessDTO.self)
+            XCTAssertEqual(business?.name, "Acme AG")
+            XCTAssertEqual(business?.address, "Main Street 1\n8000 Zurich")
+            XCTAssertEqual(business?.logoURL, "https://example.com/logo.png")
+            XCTAssertEqual(business?.websiteURL, "https://example.com")
+        }
+
+        try await app.test(.POST, "v1/businesses/identify", beforeRequest: { req in
+            req.headers.contentType = .json
+            req.body = ByteBuffer(string: #"{"pin":"000000"}"#)
+        }) { res async in
+            XCTAssertEqual(res.status, .notFound)
+        }
+    }
+
+    func testAdminAndLookupLockWhenEnvironmentIsMissing() async throws {
+        let lockedApp = try await Application.make(.testing)
+        try await configure(lockedApp, businessConfiguration: BusinessConfiguration(
+            adminPSK: nil, pinSecret: nil))
+
+        try await lockedApp.test(.GET, "admin") { res async in
+            XCTAssertEqual(res.status, .serviceUnavailable)
+            XCTAssertTrue(res.body.string.contains("Admin access is locked"))
+        }
+        try await lockedApp.test(.POST, "v1/businesses/identify", beforeRequest: { req in
+            req.headers.contentType = .json
+            req.body = ByteBuffer(string: #"{"pin":"481516"}"#)
+        }) { res async in
+            XCTAssertEqual(res.status, .serviceUnavailable)
+        }
+        try await lockedApp.asyncShutdown()
     }
 }

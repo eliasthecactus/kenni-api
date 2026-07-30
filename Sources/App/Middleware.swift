@@ -53,15 +53,19 @@ struct RateLimitMiddleware: AsyncMiddleware {
     }
 }
 
-/// Conservative security headers. This is a JSON API with no browser surface,
-/// but these are cheap and keep scanners quiet.
+/// Conservative API defaults, with the minimum additional policy needed by the
+/// server-rendered admin portal.
 struct SecurityHeadersMiddleware: AsyncMiddleware {
     func respond(to request: Request, chainingTo next: any AsyncResponder) async throws -> Response {
         let response = try await next.respond(to: request)
         response.headers.replaceOrAdd(name: "X-Content-Type-Options", value: "nosniff")
         response.headers.replaceOrAdd(name: "X-Frame-Options", value: "DENY")
         response.headers.replaceOrAdd(name: "Referrer-Policy", value: "no-referrer")
-        response.headers.replaceOrAdd(name: "Content-Security-Policy", value: "default-src 'none'")
+        let contentSecurityPolicy = request.url.path.hasPrefix("/admin")
+            ? "default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+            : "default-src 'none'"
+        response.headers.replaceOrAdd(name: "Content-Security-Policy",
+                                      value: contentSecurityPolicy)
         return response
     }
 }

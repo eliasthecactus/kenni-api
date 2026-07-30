@@ -8,6 +8,10 @@ import APNSCore
 import Crypto
 
 public func configure(_ app: Application) async throws {
+    try await configure(app, businessConfiguration: .environment)
+}
+
+func configure(_ app: Application, businessConfiguration: BusinessConfiguration) async throws {
     // Cap request bodies well below any legitimate payload (largest is the 1 MB
     // backup blob) to blunt memory-exhaustion attempts.
     app.routes.defaultMaxBodySize = "2mb"
@@ -17,6 +21,7 @@ public func configure(_ app: Application) async throws {
     let rateLimiter = RateLimiterStore(
         limit: Int(Environment.get("RATE_LIMIT") ?? "120") ?? 120,
         window: 60)
+    let businessLookupLimiter = RateLimiterStore(limit: 10, window: 60)
     app.middleware.use(RateLimitMiddleware(store: rateLimiter))
 
     // MARK: Database — Postgres in deployment (Coolify), SQLite for local dev/tests.
@@ -29,6 +34,7 @@ public func configure(_ app: Application) async throws {
     }
 
     app.migrations.add(CreateTables())
+    app.migrations.add(CreateBusinesses())
     try await app.autoMigrate()
 
     // MARK: APNs — configured only when keys are present, so local dev just logs.
@@ -75,13 +81,15 @@ public func configure(_ app: Application) async throws {
             guard !Task.isCancelled, let app else { return }
             try? await Cleanup.run(on: app.db, logger: app.logger)
             await rateLimiter.sweep()
+            await businessLookupLimiter.sweep()
         }
     }
     app.lifecycle.use(CancelOnShutdown(task: cleanupTask))
 
     app.asyncCommands.use(PushTestCommand(), as: "push-test")
 
-    try routes(app)
+    try routes(app, businessConfiguration: businessConfiguration,
+               businessLookupLimiter: businessLookupLimiter)
 }
 
 /// Reconstruct a canonical PKCS#8 PEM from a key whose newlines were flattened
