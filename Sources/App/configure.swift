@@ -37,6 +37,7 @@ func configure(_ app: Application, businessConfiguration: BusinessConfiguration)
     app.migrations.add(CreateBusinesses())
     app.migrations.add(RemoveBusinessPIN())
     app.migrations.add(CreateBusinessDevices())
+    app.migrations.add(ReplaceBusinessConfirmationChallengesWithPINs())
     try await app.autoMigrate()
 
     // MARK: APNs — configured only when keys are present, so local dev just logs.

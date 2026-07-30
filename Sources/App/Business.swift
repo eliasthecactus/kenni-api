@@ -115,20 +115,17 @@ final class BusinessConfirmation: Model, @unchecked Sendable {
 
     @ID(key: .id) var id: UUID?
     @Field(key: "business_device_id") var businessDeviceID: UUID
-    @Field(key: "challenge_digest") var challengeDigest: String
-    @Field(key: "proof_digest") var proofDigest: String
+    @Field(key: "pin_digest") var pinDigest: String
     @Field(key: "expires_at") var expiresAt: Date
     @OptionalField(key: "consumed_at") var consumedAt: Date?
     @Timestamp(key: "created_at", on: .create) var createdAt: Date?
 
     init() {}
 
-    init(id: UUID, businessDeviceID: UUID, challengeDigest: String,
-         proofDigest: String, expiresAt: Date) {
+    init(id: UUID, businessDeviceID: UUID, pinDigest: String, expiresAt: Date) {
         self.id = id
         self.businessDeviceID = businessDeviceID
-        self.challengeDigest = challengeDigest
-        self.proofDigest = proofDigest
+        self.pinDigest = pinDigest
         self.expiresAt = expiresAt
     }
 }
@@ -221,6 +218,40 @@ struct CreateBusinessDevices: AsyncMigration {
     }
 }
 
+struct ReplaceBusinessConfirmationChallengesWithPINs: AsyncMigration {
+    func prepare(on database: any Database) async throws {
+        // Confirmations live for only 90 seconds, so replacing this ephemeral table
+        // is both safer and simpler than preserving obsolete challenge-response rows.
+        try await database.schema(BusinessConfirmation.schema).delete()
+        try await database.schema(BusinessConfirmation.schema)
+            .id()
+            .field("business_device_id", .uuid, .required,
+                   .references(BusinessDevice.schema, "id", onDelete: .cascade))
+            .field("pin_digest", .string, .required)
+            .field("expires_at", .datetime, .required)
+            .field("consumed_at", .datetime)
+            .field("created_at", .datetime)
+            .unique(on: "business_device_id")
+            .unique(on: "pin_digest")
+            .create()
+    }
+
+    func revert(on database: any Database) async throws {
+        try await database.schema(BusinessConfirmation.schema).delete()
+        try await database.schema(BusinessConfirmation.schema)
+            .id()
+            .field("business_device_id", .uuid, .required,
+                   .references(BusinessDevice.schema, "id", onDelete: .cascade))
+            .field("challenge_digest", .string, .required)
+            .field("proof_digest", .string, .required)
+            .field("expires_at", .datetime, .required)
+            .field("consumed_at", .datetime)
+            .field("created_at", .datetime)
+            .unique(on: "proof_digest")
+            .create()
+    }
+}
+
 struct BusinessDTO: Content, Equatable {
     let id: UUID
     let name: String
@@ -261,18 +292,13 @@ struct BusinessDeviceAPNSDTO: Content {
     let apnsToken: String
 }
 
-struct BusinessChallengeDTO: Content {
-    let challenge: String
-}
-
-struct BusinessConfirmationDTO: Content {
-    let responseURL: String
+struct BusinessPINDTO: Content {
+    let pin: String
     let expiresAt: Int
 }
 
-struct VerifyBusinessConfirmationDTO: Content {
-    let responseURL: String
-    let challenge: String
+struct VerifyBusinessPINDTO: Content {
+    let pin: String
 }
 
 struct BusinessDeviceAuth {
@@ -305,25 +331,14 @@ struct BusinessDeviceAuth {
     }
 }
 
-struct BusinessConfirmationLink {
-    let id: UUID
-    let proof: String
-
-    init?(urlString: String) {
-        guard let components = URLComponents(string: urlString),
-              components.scheme == "kenni", components.host == "business-confirm",
-              let idRaw = components.queryItems?.first(where: { $0.name == "id" })?.value,
-              let id = UUID(uuidString: idRaw),
-              let proof = components.queryItems?.first(where: { $0.name == "proof" })?.value,
-              proof.count >= 40 else { return nil }
-        self.id = id
-        self.proof = proof
-    }
-}
 
 func randomBusinessToken() -> String {
     let key = SymmetricKey(size: .bits256)
     return key.withUnsafeBytes { Data($0).base64URLEncodedString() }
+}
+
+func randomBusinessPIN() -> String {
+    String(format: "%06d", Int.random(in: 0..<1_000_000))
 }
 
 func timingSafeEqual(_ lhs: String, _ rhs: String) -> Bool {

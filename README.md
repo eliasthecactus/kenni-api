@@ -2,7 +2,7 @@
 
 Backend for [KENNI](https://benavo.ch/apps/kenni). Contact exchange and all verification
 cryptography happen **on-device**; the relay only sees signed, opaque envelopes. It also
-enrolls administrator-approved business devices and verifies their live confirmations.
+enrolls administrator-approved business devices and verifies their one-time PINs.
 
 There are no user accounts, emails, user names, or analytics. The relay holds no identity
 private keys and cannot read or forge verification payloads. See [`SECURITY.md`](SECURITY.md)
@@ -24,8 +24,8 @@ for the threat model.
 | `POST /v1/business-device-invitations/claim` | Consume a one-time admin invitation and bind a business-device public key |
 | `GET /v1/business-devices/me` | Return the authenticated business device, business profile, and revocation status |
 | `PUT /v1/business-devices/apns-token` | Register the authenticated business device for revocation pushes |
-| `POST /v1/business-devices/confirmations` | Issue a short-lived, one-time response for a fresh customer challenge |
-| `POST /v1/business-confirmations/verify` | Consume a response and return the active approved business profile |
+| `POST /v1/business-devices/verification-pins` | Issue a short-lived, one-time PIN from an authenticated business device |
+| `POST /v1/business-verifications/verify` | Consume a PIN and return the active approved business profile |
 | `GET /admin` | Server-rendered business and device administration portal |
 
 Every authenticated request is signed with the caller's Ed25519 key
@@ -37,7 +37,7 @@ never here.
 > identity card embedded, so it works fully offline without the server.
 
 The admin portal uses an eight-hour, HTTP-only session after shared-PSK authentication.
-One-time enrollment links and confirmation responses are stored only as keyed HMAC digests.
+One-time enrollment links and verification PINs are stored only as keyed HMAC digests.
 If either admin environment variable is missing, the portal and business-device routes lock.
 
 ## Config (env)

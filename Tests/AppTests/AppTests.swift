@@ -186,7 +186,7 @@ final class AppTests: XCTestCase {
         }
     }
 
-    func testAdminEnrollmentConfirmationAndRevocationLifecycle() async throws {
+    func testAdminEnrollmentPINAndRevocationLifecycle() async throws {
         try await app.test(.GET, "admin") { res async in
             XCTAssertEqual(res.status, .unauthorized)
             XCTAssertEqual(res.headers.contentType?.type, "text")
@@ -298,45 +298,47 @@ final class AppTests: XCTestCase {
             XCTAssertEqual(res.status, .gone)
         }
 
-        let confirmationPath = "/v1/business-devices/confirmations"
-        let challenge = Data(repeating: 0x42, count: 32).base64URLEncodedString()
-        let challengeData = try JSONEncoder().encode(BusinessChallengeDTO(challenge: challenge))
-        let challengeBody = String(decoding: challengeData, as: UTF8.self)
-        var confirmation: BusinessConfirmationDTO?
-        try await app.test(
-            .POST, String(confirmationPath.dropFirst()),
-            beforeRequest: { req in
-                req.headers = try self.businessHeaders(
-                    method: "POST", path: confirmationPath, body: challengeBody,
-                    deviceID: enrolled.deviceID, key: deviceKey)
-                req.body = ByteBuffer(string: challengeBody)
+        let pinPath = "/v1/business-devices/verification-pins"
+        func issuePIN() async throws -> BusinessPINDTO {
+            var issuedPIN: BusinessPINDTO?
+            try await app.test(
+                .POST, String(pinPath.dropFirst()),
+                beforeRequest: { req in
+                    req.headers = try self.businessHeaders(
+                        method: "POST", path: pinPath, body: "",
+                        deviceID: enrolled.deviceID, key: deviceKey)
+                }
+            ) { res async in
+                XCTAssertEqual(res.status, .ok)
+                issuedPIN = try? res.content.decode(BusinessPINDTO.self)
             }
-        ) { res async in
-            XCTAssertEqual(res.status, .ok)
-            confirmation = try? res.content.decode(BusinessConfirmationDTO.self)
+            return try XCTUnwrap(issuedPIN)
         }
-        let issued = try XCTUnwrap(confirmation)
 
-        let verificationData = try JSONEncoder().encode(VerifyBusinessConfirmationDTO(
-            responseURL: issued.responseURL, challenge: challenge))
-        let verificationBody = String(decoding: verificationData, as: UTF8.self)
-        let wrongChallenge = Data(repeating: 0x24, count: 32).base64URLEncodedString()
-        let mismatchedData = try JSONEncoder().encode(VerifyBusinessConfirmationDTO(
-            responseURL: issued.responseURL, challenge: wrongChallenge))
+        let issued = try await issuePIN()
+        XCTAssertEqual(issued.pin.count, 6)
+        XCTAssertTrue(issued.pin.allSatisfy(\.isNumber))
+        XCTAssertGreaterThan(issued.expiresAt, Int(Date().timeIntervalSince1970))
+
+        let wrongPIN = issued.pin == "000000" ? "000001" : "000000"
+        let wrongData = try JSONEncoder().encode(VerifyBusinessPINDTO(pin: wrongPIN))
         try await app.test(
-            .POST, "v1/business-confirmations/verify",
+            .POST, "v1/business-verifications/verify",
             beforeRequest: { req in
                 req.headers.contentType = .json
-                req.body = ByteBuffer(data: mismatchedData)
+                req.body = ByteBuffer(data: wrongData)
             }
         ) { res async in
             XCTAssertEqual(res.status, .gone)
         }
+
+        let verificationData = try JSONEncoder().encode(
+            VerifyBusinessPINDTO(pin: issued.pin))
         try await app.test(
-            .POST, "v1/business-confirmations/verify",
+            .POST, "v1/business-verifications/verify",
             beforeRequest: { req in
                 req.headers.contentType = .json
-                req.body = ByteBuffer(string: verificationBody)
+                req.body = ByteBuffer(data: verificationData)
             }
         ) { res async in
             XCTAssertEqual(res.status, .ok)
@@ -345,29 +347,28 @@ final class AppTests: XCTestCase {
             XCTAssertEqual(verified?.name, "Acme AG")
         }
         try await app.test(
-            .POST, "v1/business-confirmations/verify",
+            .POST, "v1/business-verifications/verify",
             beforeRequest: { req in
                 req.headers.contentType = .json
-                req.body = ByteBuffer(string: verificationBody)
+                req.body = ByteBuffer(data: verificationData)
             }
         ) { res async in
             XCTAssertEqual(res.status, .gone)
         }
 
-        var revokedConfirmation: BusinessConfirmationDTO?
+        let replacedPIN = try await issuePIN()
+        let pendingRevocation = try await issuePIN()
+        let replacedData = try JSONEncoder().encode(
+            VerifyBusinessPINDTO(pin: replacedPIN.pin))
         try await app.test(
-            .POST, String(confirmationPath.dropFirst()),
+            .POST, "v1/business-verifications/verify",
             beforeRequest: { req in
-                req.headers = try self.businessHeaders(
-                    method: "POST", path: confirmationPath, body: challengeBody,
-                    deviceID: enrolled.deviceID, key: deviceKey)
-                req.body = ByteBuffer(string: challengeBody)
+                req.headers.contentType = .json
+                req.body = ByteBuffer(data: replacedData)
             }
         ) { res async in
-            XCTAssertEqual(res.status, .ok)
-            revokedConfirmation = try? res.content.decode(BusinessConfirmationDTO.self)
+            XCTAssertEqual(res.status, .gone)
         }
-        let pendingRevocation = try XCTUnwrap(revokedConfirmation)
 
         try await app.test(
             .POST, "admin/businesses/\(businessID)/devices/\(enrolled.deviceID)/revoke",
@@ -381,10 +382,10 @@ final class AppTests: XCTestCase {
             XCTAssertEqual(res.status, .seeOther)
         }
 
-        let revokedData = try JSONEncoder().encode(VerifyBusinessConfirmationDTO(
-            responseURL: pendingRevocation.responseURL, challenge: challenge))
+        let revokedData = try JSONEncoder().encode(
+            VerifyBusinessPINDTO(pin: pendingRevocation.pin))
         try await app.test(
-            .POST, "v1/business-confirmations/verify",
+            .POST, "v1/business-verifications/verify",
             beforeRequest: { req in
                 req.headers.contentType = .json
                 req.body = ByteBuffer(data: revokedData)
@@ -393,12 +394,11 @@ final class AppTests: XCTestCase {
             XCTAssertEqual(res.status, .gone)
         }
         try await app.test(
-            .POST, String(confirmationPath.dropFirst()),
+            .POST, String(pinPath.dropFirst()),
             beforeRequest: { req in
                 req.headers = try self.businessHeaders(
-                    method: "POST", path: confirmationPath, body: challengeBody,
+                    method: "POST", path: pinPath, body: "",
                     deviceID: enrolled.deviceID, key: deviceKey)
-                req.body = ByteBuffer(string: challengeBody)
             }
         ) { res async in
             XCTAssertEqual(res.status, .gone)

@@ -1,6 +1,7 @@
 import Crypto
 import Vapor
 import Fluent
+import FluentSQL
 
 struct DeviceDTO: Content {
     let apnsToken: String
@@ -37,7 +38,7 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
     let v1 = app.grouped("v1")
     let businessEnrollmentRoutes = v1.grouped("business-device-invitations")
         .grouped(RateLimitMiddleware(store: businessLookupLimiter))
-    let businessConfirmationRoutes = v1.grouped("business-confirmations")
+    let businessVerificationRoutes = v1.grouped("business-verifications")
         .grouped(RateLimitMiddleware(store: businessLookupLimiter))
 
     // A one-time administrator invitation binds a freshly-generated device key
@@ -127,59 +128,68 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
         return .ok
     }
 
-    businessDevices.post("confirmations") { req async throws -> BusinessConfirmationDTO in
+    businessDevices.post("verification-pins") { req async throws -> BusinessPINDTO in
         guard businessConfiguration.businessSecret != nil else {
             throw Abort(.serviceUnavailable, reason: "business verification is not configured")
         }
         let device = try await BusinessDeviceAuth.verify(req, body: req.body.data)
-        let dto = try req.content.decode(BusinessChallengeDTO.self)
-        guard let challenge = Data(base64URLEncoded: dto.challenge),
-              challenge.count == 32,
-              let challengeDigest = businessConfiguration.digest(
-                context: "business-challenge", value: dto.challenge) else {
-            throw Abort(.badRequest, reason: "invalid challenge")
+        let deviceID = try device.requireID()
+
+        for _ in 0..<10 {
+            let pin = randomBusinessPIN()
+            guard let pinDigest = businessConfiguration.digest(
+                context: "business-pin", value: pin) else {
+                throw Abort(.serviceUnavailable)
+            }
+            let expiresAt = Date().addingTimeInterval(90)
+            do {
+                try await req.db.transaction { database in
+                    try await BusinessConfirmation.query(on: database)
+                        .filter(\.$businessDeviceID == deviceID)
+                        .delete()
+                    try await BusinessConfirmation(
+                        id: UUID(), businessDeviceID: deviceID,
+                        pinDigest: pinDigest, expiresAt: expiresAt)
+                        .create(on: database)
+                    device.lastSeenAt = .now
+                    try await device.save(on: database)
+                }
+                return BusinessPINDTO(
+                    pin: pin, expiresAt: Int(expiresAt.timeIntervalSince1970))
+            } catch let error as any DatabaseError where error.isConstraintFailure {
+                continue
+            }
         }
-        let confirmationID = UUID()
-        let proof = randomBusinessToken()
-        guard let proofDigest = businessConfiguration.digest(
-            context: "business-confirmation", value: proof) else {
-            throw Abort(.serviceUnavailable)
-        }
-        let expiresAt = Date().addingTimeInterval(90)
-        try await BusinessConfirmation(
-            id: confirmationID, businessDeviceID: try device.requireID(),
-            challengeDigest: challengeDigest, proofDigest: proofDigest,
-            expiresAt: expiresAt).create(on: req.db)
-        device.lastSeenAt = .now
-        try await device.save(on: req.db)
-        return BusinessConfirmationDTO(
-            responseURL: "kenni://business-confirm?id=\(confirmationID.uuidString)&proof=\(proof)",
-            expiresAt: Int(expiresAt.timeIntervalSince1970))
+        throw Abort(.serviceUnavailable, reason: "could not allocate a verification PIN")
     }
 
-    businessConfirmationRoutes.post("verify") { req async throws -> BusinessDTO in
+    businessVerificationRoutes.post("verify") { req async throws -> BusinessDTO in
         guard businessConfiguration.businessSecret != nil else {
             throw Abort(.serviceUnavailable, reason: "business verification is not configured")
         }
-        let dto = try req.content.decode(VerifyBusinessConfirmationDTO.self)
-        guard let link = BusinessConfirmationLink(urlString: dto.responseURL),
-              let challenge = Data(base64URLEncoded: dto.challenge), challenge.count == 32,
-              let proofDigest = businessConfiguration.digest(
-                context: "business-confirmation", value: link.proof),
-              let challengeDigest = businessConfiguration.digest(
-                context: "business-challenge", value: dto.challenge),
-              let confirmation = try await BusinessConfirmation.find(link.id, on: req.db),
-              timingSafeEqual(confirmation.proofDigest, proofDigest),
-              timingSafeEqual(confirmation.challengeDigest, challengeDigest),
-              confirmation.expiresAt > Date(), confirmation.consumedAt == nil,
-              let device = try await BusinessDevice.find(
-                confirmation.businessDeviceID, on: req.db),
+        let dto = try req.content.decode(VerifyBusinessPINDTO.self)
+        guard dto.pin.utf8.count == 6,
+              dto.pin.utf8.allSatisfy({ (48...57).contains($0) }),
+              let pinDigest = businessConfiguration.digest(
+                context: "business-pin", value: dto.pin),
+              let sql = req.db as? any SQLDatabase else {
+            throw Abort(.badRequest, reason: "invalid verification PIN")
+        }
+
+        guard let row = try await sql.update(BusinessConfirmation.schema)
+            .set("consumed_at", to: Date())
+            .where("pin_digest", .equal, pinDigest)
+            .where("expires_at", .greaterThan, Date())
+            .where("consumed_at", .is, SQLLiteral.null)
+            .returning("business_device_id")
+            .first(),
+              let deviceID = try? row.decode(
+                column: "business_device_id", as: UUID.self),
+              let device = try await BusinessDevice.find(deviceID, on: req.db),
               device.revokedAt == nil,
               let business = try await Business.find(device.businessID, on: req.db) else {
-            throw Abort(.gone, reason: "confirmation is invalid, expired, used, or revoked")
+            throw Abort(.gone, reason: "verification PIN is invalid, expired, used, or revoked")
         }
-        confirmation.consumedAt = .now
-        try await confirmation.save(on: req.db)
         return try BusinessDTO(business)
     }
 
