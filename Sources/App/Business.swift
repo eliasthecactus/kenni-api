@@ -1,5 +1,6 @@
 import Crypto
 import Fluent
+import FluentSQL
 import Vapor
 
 struct BusinessConfiguration: Sendable {
@@ -149,22 +150,22 @@ struct CreateBusinesses: AsyncMigration {
 
 struct RemoveBusinessPIN: AsyncMigration {
     func prepare(on database: any Database) async throws {
-        // SQLite cannot drop a column from this UUID-primary-key table without
-        // rebuilding it. Fresh SQLite installs never create the legacy column;
-        // deployed PostgreSQL databases remove it here.
-        guard !String(reflecting: type(of: database.configuration)).contains("SQLite")
-        else { return }
-        try await database.schema(Business.schema)
-            .deleteField("pin_digest")
-            .update()
+        // Older PostgreSQL installs have this legacy column; fresh installs do
+        // not. The conditional drop also recovers a deployment where
+        // CreateBusinesses completed before this migration previously failed.
+        guard !String(reflecting: type(of: database.configuration)).contains("SQLite"),
+              let sql = database as? any SQLDatabase else { return }
+        try await sql.raw(
+            "ALTER TABLE \"businesses\" DROP COLUMN IF EXISTS \"pin_digest\""
+        ).run()
     }
 
     func revert(on database: any Database) async throws {
-        guard !String(reflecting: type(of: database.configuration)).contains("SQLite")
-        else { return }
-        try await database.schema(Business.schema)
-            .field("pin_digest", .string)
-            .update()
+        guard !String(reflecting: type(of: database.configuration)).contains("SQLite"),
+              let sql = database as? any SQLDatabase else { return }
+        try await sql.raw(
+            "ALTER TABLE \"businesses\" ADD COLUMN IF NOT EXISTS \"pin_digest\" TEXT"
+        ).run()
     }
 }
 
