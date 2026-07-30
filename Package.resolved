@@ -1,5 +1,5 @@
 {
-  "originHash" : "07f89fb1c3b5b4004cb0d4b3dc47116cef5f99476202ebba51caff8614c3000b",
+  "originHash" : "46869a09c376dce214317d2dae46160246c1692d0cc321a0cd56a8ff0a5e1810",
   "pins" : [
     {
       "identity" : "apns",
@@ -314,6 +314,15 @@
       "state" : {
         "revision" : "0c0290ff6b24942dadb83a929ffaaa1481df04a2",
         "version" : "1.1.1"
+      }
+    },
+    {
+      "identity" : "swift-qrcode-generator",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/fwcd/swift-qrcode-generator.git",
+      "state" : {
+        "revision" : "5ca09b6a2ad190f94aa3d6ddef45b187f8c0343b",
+        "version" : "1.0.3"
       }
     },
     {
