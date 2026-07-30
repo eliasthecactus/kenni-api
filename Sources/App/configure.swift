@@ -35,6 +35,8 @@ func configure(_ app: Application, businessConfiguration: BusinessConfiguration)
 
     app.migrations.add(CreateTables())
     app.migrations.add(CreateBusinesses())
+    app.migrations.add(RemoveBusinessPIN())
+    app.migrations.add(CreateBusinessDevices())
     try await app.autoMigrate()
 
     // MARK: APNs — configured only when keys are present, so local dev just logs.
@@ -123,6 +125,11 @@ enum Cleanup {
     static func run(on db: any Database, logger: Logger) async throws {
         let now = Date()
         try await VerificationRequest.query(on: db).filter(\.$expiresAt < now).delete()
+        try await BusinessConfirmation.query(on: db).filter(\.$expiresAt < now).delete()
+        try await BusinessDeviceInvitation.query(on: db)
+            .filter(\.$expiresAt < now)
+            .filter(\.$claimedAt == nil)
+            .delete()
         logger.debug("cleanup pass done")
     }
 }

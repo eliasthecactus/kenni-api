@@ -8,7 +8,7 @@ final class AppTests: XCTestCase {
     override func setUp() async throws {
         app = try await Application.make(.testing)
         try await configure(app, businessConfiguration: BusinessConfiguration(
-            adminPSK: "test-admin-key", pinSecret: "test-business-pin-secret"))
+            adminPSK: "test-admin-key", businessSecret: "test-business-token-secret"))
     }
 
     override func tearDown() async throws {
@@ -26,6 +26,22 @@ final class AppTests: XCTestCase {
         headers.add(name: "X-Kenni-Id", value: key.publicKey.rawRepresentation.base64URLEncodedString())
         headers.add(name: "X-Kenni-Timestamp", value: timestamp)
         headers.add(name: "X-Kenni-Signature", value: signature.base64URLEncodedString())
+        headers.contentType = .json
+        return headers
+    }
+
+    private func businessHeaders(method: String, path: String, body: String,
+                                 deviceID: UUID,
+                                 key: Curve25519.Signing.PrivateKey) throws -> HTTPHeaders {
+        let timestamp = String(Int(Date().timeIntervalSince1970))
+        let message = Data(
+            "kenni/v1/business-device\n\(method)\n\(path)\n\(timestamp)\n\(body)".utf8)
+        let signature = try key.signature(for: message)
+        var headers = HTTPHeaders()
+        headers.add(name: "X-Kenni-Business-Device", value: deviceID.uuidString)
+        headers.add(name: "X-Kenni-Business-Timestamp", value: timestamp)
+        headers.add(name: "X-Kenni-Business-Signature",
+                    value: signature.base64URLEncodedString())
         headers.contentType = .json
         return headers
     }
@@ -170,7 +186,7 @@ final class AppTests: XCTestCase {
         }
     }
 
-    func testAdminPortalCreatesBusinessForUnsignedPINLookup() async throws {
+    func testAdminEnrollmentConfirmationAndRevocationLifecycle() async throws {
         try await app.test(.GET, "admin") { res async in
             XCTAssertEqual(res.status, .unauthorized)
             XCTAssertEqual(res.headers.contentType?.type, "text")
@@ -178,8 +194,8 @@ final class AppTests: XCTestCase {
 
         var cookie: String?
         try await app.test(.POST, "admin/login", beforeRequest: { req in
-            req.headers.replaceOrAdd(name: "Content-Type",
-                                     value: "application/x-www-form-urlencoded")
+            req.headers.replaceOrAdd(
+                name: "Content-Type", value: "application/x-www-form-urlencoded")
             req.body = ByteBuffer(string: "psk=test-admin-key")
         }) { res async in
             XCTAssertEqual(res.status, .seeOther)
@@ -193,58 +209,234 @@ final class AppTests: XCTestCase {
             req.headers.replaceOrAdd(name: "Cookie", value: sessionCookie)
         }) { res async in
             XCTAssertEqual(res.status, .ok)
-            let html = res.body.string
             let marker = #"name="csrf" value=""#
-            if let markerRange = html.range(of: marker) {
-                csrf = String(html[markerRange.upperBound...].prefix { $0 != "\"" })
+            if let markerRange = res.body.string.range(of: marker) {
+                csrf = String(res.body.string[markerRange.upperBound...].prefix { $0 != "\"" })
             }
         }
         let csrfToken = try XCTUnwrap(csrf)
 
         try await app.test(.POST, "admin/businesses", beforeRequest: { req in
             req.headers.replaceOrAdd(name: "Cookie", value: sessionCookie)
-            req.headers.replaceOrAdd(name: "Content-Type",
-                                     value: "application/x-www-form-urlencoded")
+            req.headers.replaceOrAdd(
+                name: "Content-Type", value: "application/x-www-form-urlencoded")
             req.body = ByteBuffer(string:
-                "csrf=\(csrfToken)&name=Acme%20AG&pin=481516&logoURL=https%3A%2F%2Fexample.com%2Flogo.png&address=Main%20Street%201%0A8000%20Zurich&websiteURL=https%3A%2F%2Fexample.com")
+                "csrf=\(csrfToken)&name=Acme%20AG&logoURL=https%3A%2F%2Fexample.com%2Flogo.png&address=Main%20Street%201%0A8000%20Zurich&websiteURL=https%3A%2F%2Fexample.com")
         }) { res async in
             XCTAssertEqual(res.status, .seeOther)
         }
+        let createdBusiness = try await Business.query(on: app.db).first()
+        let business = try XCTUnwrap(createdBusiness)
+        let businessID = try business.requireID()
 
-        let lookupBody = #"{"pin":"481516"}"#
-        try await app.test(.POST, "v1/businesses/identify", beforeRequest: { req in
-            req.headers.contentType = .json
-            req.body = ByteBuffer(string: lookupBody)
-        }) { res async in
+        var enrollmentToken: String?
+        try await app.test(
+            .POST, "admin/businesses/\(businessID)/devices",
+            beforeRequest: { req in
+                req.headers.replaceOrAdd(name: "Cookie", value: sessionCookie)
+                req.headers.replaceOrAdd(
+                    name: "Content-Type", value: "application/x-www-form-urlencoded")
+                req.body = ByteBuffer(
+                    string: "csrf=\(csrfToken)&deviceLabel=Reception%20iPad")
+            }
+        ) { res async in
+            XCTAssertEqual(res.status, .created)
+            XCTAssertTrue(res.body.string.contains("<svg"))
+            let marker = "kenni://business/enroll?token="
+            if let markerRange = res.body.string.range(of: marker) {
+                enrollmentToken = String(
+                    res.body.string[markerRange.upperBound...].prefix { $0 != "<" })
+            }
+        }
+        let token = try XCTUnwrap(enrollmentToken)
+
+        let deviceKey = Curve25519.Signing.PrivateKey()
+        let publicKey = deviceKey.publicKey.rawRepresentation.base64URLEncodedString()
+        let enrollmentSignature = try deviceKey.signature(
+            for: BusinessDeviceAuth.enrollmentMessage(token: token, publicKey: publicKey))
+            .base64URLEncodedString()
+        let claimData = try JSONEncoder().encode(ClaimBusinessDeviceDTO(
+            token: token, publicKey: publicKey, signature: enrollmentSignature))
+        let claimBody = String(decoding: claimData, as: UTF8.self)
+        let forgedSignature = try Curve25519.Signing.PrivateKey().signature(
+            for: BusinessDeviceAuth.enrollmentMessage(token: token, publicKey: publicKey))
+            .base64URLEncodedString()
+        let forgedClaimData = try JSONEncoder().encode(ClaimBusinessDeviceDTO(
+            token: token, publicKey: publicKey, signature: forgedSignature))
+        try await app.test(
+            .POST, "v1/business-device-invitations/claim",
+            beforeRequest: { req in
+                req.headers.contentType = .json
+                req.body = ByteBuffer(data: forgedClaimData)
+            }
+        ) { res async in
+            XCTAssertEqual(res.status, .gone)
+        }
+        var credential: BusinessDeviceCredentialDTO?
+        try await app.test(
+            .POST, "v1/business-device-invitations/claim",
+            beforeRequest: { req in
+                req.headers.contentType = .json
+                req.body = ByteBuffer(string: claimBody)
+            }
+        ) { res async in
             XCTAssertEqual(res.status, .ok)
-            let business = try? res.content.decode(BusinessDTO.self)
-            XCTAssertEqual(business?.name, "Acme AG")
-            XCTAssertEqual(business?.address, "Main Street 1\n8000 Zurich")
-            XCTAssertEqual(business?.logoURL, "https://example.com/logo.png")
-            XCTAssertEqual(business?.websiteURL, "https://example.com")
+            credential = try? res.content.decode(BusinessDeviceCredentialDTO.self)
+            XCTAssertEqual(credential?.deviceLabel, "Reception iPad")
+            XCTAssertEqual(credential?.business.name, "Acme AG")
+            XCTAssertEqual(credential?.business.address, "Main Street 1\n8000 Zurich")
+        }
+        let enrolled = try XCTUnwrap(credential)
+
+        try await app.test(
+            .POST, "v1/business-device-invitations/claim",
+            beforeRequest: { req in
+                req.headers.contentType = .json
+                req.body = ByteBuffer(string: claimBody)
+            }
+        ) { res async in
+            XCTAssertEqual(res.status, .gone)
         }
 
-        try await app.test(.POST, "v1/businesses/identify", beforeRequest: { req in
-            req.headers.contentType = .json
-            req.body = ByteBuffer(string: #"{"pin":"000000"}"#)
-        }) { res async in
-            XCTAssertEqual(res.status, .notFound)
+        let confirmationPath = "/v1/business-devices/confirmations"
+        let challenge = Data(repeating: 0x42, count: 32).base64URLEncodedString()
+        let challengeData = try JSONEncoder().encode(BusinessChallengeDTO(challenge: challenge))
+        let challengeBody = String(decoding: challengeData, as: UTF8.self)
+        var confirmation: BusinessConfirmationDTO?
+        try await app.test(
+            .POST, String(confirmationPath.dropFirst()),
+            beforeRequest: { req in
+                req.headers = try self.businessHeaders(
+                    method: "POST", path: confirmationPath, body: challengeBody,
+                    deviceID: enrolled.deviceID, key: deviceKey)
+                req.body = ByteBuffer(string: challengeBody)
+            }
+        ) { res async in
+            XCTAssertEqual(res.status, .ok)
+            confirmation = try? res.content.decode(BusinessConfirmationDTO.self)
+        }
+        let issued = try XCTUnwrap(confirmation)
+
+        let verificationData = try JSONEncoder().encode(VerifyBusinessConfirmationDTO(
+            responseURL: issued.responseURL, challenge: challenge))
+        let verificationBody = String(decoding: verificationData, as: UTF8.self)
+        let wrongChallenge = Data(repeating: 0x24, count: 32).base64URLEncodedString()
+        let mismatchedData = try JSONEncoder().encode(VerifyBusinessConfirmationDTO(
+            responseURL: issued.responseURL, challenge: wrongChallenge))
+        try await app.test(
+            .POST, "v1/business-confirmations/verify",
+            beforeRequest: { req in
+                req.headers.contentType = .json
+                req.body = ByteBuffer(data: mismatchedData)
+            }
+        ) { res async in
+            XCTAssertEqual(res.status, .gone)
+        }
+        try await app.test(
+            .POST, "v1/business-confirmations/verify",
+            beforeRequest: { req in
+                req.headers.contentType = .json
+                req.body = ByteBuffer(string: verificationBody)
+            }
+        ) { res async in
+            XCTAssertEqual(res.status, .ok)
+            let verified = try? res.content.decode(BusinessDTO.self)
+            XCTAssertEqual(verified?.id, businessID)
+            XCTAssertEqual(verified?.name, "Acme AG")
+        }
+        try await app.test(
+            .POST, "v1/business-confirmations/verify",
+            beforeRequest: { req in
+                req.headers.contentType = .json
+                req.body = ByteBuffer(string: verificationBody)
+            }
+        ) { res async in
+            XCTAssertEqual(res.status, .gone)
+        }
+
+        var revokedConfirmation: BusinessConfirmationDTO?
+        try await app.test(
+            .POST, String(confirmationPath.dropFirst()),
+            beforeRequest: { req in
+                req.headers = try self.businessHeaders(
+                    method: "POST", path: confirmationPath, body: challengeBody,
+                    deviceID: enrolled.deviceID, key: deviceKey)
+                req.body = ByteBuffer(string: challengeBody)
+            }
+        ) { res async in
+            XCTAssertEqual(res.status, .ok)
+            revokedConfirmation = try? res.content.decode(BusinessConfirmationDTO.self)
+        }
+        let pendingRevocation = try XCTUnwrap(revokedConfirmation)
+
+        try await app.test(
+            .POST, "admin/businesses/\(businessID)/devices/\(enrolled.deviceID)/revoke",
+            beforeRequest: { req in
+                req.headers.replaceOrAdd(name: "Cookie", value: sessionCookie)
+                req.headers.replaceOrAdd(
+                    name: "Content-Type", value: "application/x-www-form-urlencoded")
+                req.body = ByteBuffer(string: "csrf=\(csrfToken)")
+            }
+        ) { res async in
+            XCTAssertEqual(res.status, .seeOther)
+        }
+
+        let revokedData = try JSONEncoder().encode(VerifyBusinessConfirmationDTO(
+            responseURL: pendingRevocation.responseURL, challenge: challenge))
+        try await app.test(
+            .POST, "v1/business-confirmations/verify",
+            beforeRequest: { req in
+                req.headers.contentType = .json
+                req.body = ByteBuffer(data: revokedData)
+            }
+        ) { res async in
+            XCTAssertEqual(res.status, .gone)
+        }
+        try await app.test(
+            .POST, String(confirmationPath.dropFirst()),
+            beforeRequest: { req in
+                req.headers = try self.businessHeaders(
+                    method: "POST", path: confirmationPath, body: challengeBody,
+                    deviceID: enrolled.deviceID, key: deviceKey)
+                req.body = ByteBuffer(string: challengeBody)
+            }
+        ) { res async in
+            XCTAssertEqual(res.status, .gone)
+        }
+
+        let statusPath = "/v1/business-devices/me"
+        try await app.test(
+            .GET, String(statusPath.dropFirst()),
+            beforeRequest: { req in
+                req.headers = try self.businessHeaders(
+                    method: "GET", path: statusPath, body: "",
+                    deviceID: enrolled.deviceID, key: deviceKey)
+            }
+        ) { res async in
+            XCTAssertEqual(res.status, .ok)
+            let status = try? res.content.decode(BusinessDeviceStatusDTO.self)
+            XCTAssertEqual(status?.status, "revoked")
+            XCTAssertNotNil(status?.revokedAt)
         }
     }
 
-    func testAdminAndLookupLockWhenEnvironmentIsMissing() async throws {
+    func testAdminAndBusinessEnrollmentLockWhenEnvironmentIsMissing() async throws {
         let lockedApp = try await Application.make(.testing)
         try await configure(lockedApp, businessConfiguration: BusinessConfiguration(
-            adminPSK: nil, pinSecret: nil))
+            adminPSK: nil, businessSecret: nil))
 
         try await lockedApp.test(.GET, "admin") { res async in
             XCTAssertEqual(res.status, .serviceUnavailable)
             XCTAssertTrue(res.body.string.contains("Admin access is locked"))
         }
-        try await lockedApp.test(.POST, "v1/businesses/identify", beforeRequest: { req in
-            req.headers.contentType = .json
-            req.body = ByteBuffer(string: #"{"pin":"481516"}"#)
-        }) { res async in
+        try await lockedApp.test(
+            .POST, "v1/business-device-invitations/claim",
+            beforeRequest: { req in
+                req.headers.contentType = .json
+                req.body = ByteBuffer(
+                    string: #"{"token":"unused","publicKey":"unused","signature":"unused"}"#)
+            }
+        ) { res async in
             XCTAssertEqual(res.status, .serviceUnavailable)
         }
         try await lockedApp.asyncShutdown()
