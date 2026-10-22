@@ -4,7 +4,12 @@ import Vapor
 enum Entrypoint {
     static func main() async throws {
         var env = try Environment.detect()
-        try LoggingSystem.bootstrap(from: &env)
+        if Environment.get("LOG_FORMAT") == "json" {
+            let level = Environment.get("LOG_LEVEL").flatMap(Logger.Level.init(rawValue:)) ?? .info
+            LoggingSystem.bootstrap { JSONLogHandler(label: $0, logLevel: level) }
+        } else {
+            try LoggingSystem.bootstrap(from: &env)
+        }
 
         let app = try await Application.make(env)
         do {

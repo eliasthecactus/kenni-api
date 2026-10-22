@@ -2,9 +2,7 @@ import Fluent
 import Vapor
 
 func routes(_ app: Application, businessConfiguration: BusinessConfiguration) throws {
-    app.get("health") { _ in
-        ["status": "ok"]
-    }
+    registerOperationalRoutes(on: app)
     registerAdminPortal(on: app, configuration: businessConfiguration)
 
     let v1 = app.grouped("v1")

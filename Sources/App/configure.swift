@@ -45,7 +45,11 @@ func configure(_ app: Application, businessConfiguration: BusinessConfiguration)
     app.migrations.add(CreateDeviceRegistrations())
     app.migrations.add(IndexDeviceRegistrations())
     app.migrations.add(AddBusinessDeviceAPNSEnvironment())
-    try await app.autoMigrate()
+    // Single instance: migrate on boot. Several replicas: set AUTO_MIGRATE=false
+    // and run `App migrate --yes` once per deploy instead.
+    if Environment.get("AUTO_MIGRATE") != "false" {
+        try await app.autoMigrate()
+    }
 
     // MARK: APNs — configured only when keys are present, so local dev just logs.
     // APNS_KEY_P8 holds the key content (Coolify multiline env); APNS_KEY_PATH points
