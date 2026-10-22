@@ -21,6 +21,7 @@ func configure(_ app: Application, businessConfiguration: BusinessConfiguration)
     app.clientIPResolver = .fromEnvironment(Environment.get("TRUST_PROXY"))
     app.acceptsLegacySignatures = Environment.get("ACCEPT_LEGACY_SIGNATURES") != "false"
     app.rateLimits = .fromEnvironment()
+    app.businessConfiguration = businessConfiguration
 
     // Global middleware: metrics, security headers, per-IP rate limit.
     app.middleware.use(MetricsMiddleware())
@@ -45,6 +46,8 @@ func configure(_ app: Application, businessConfiguration: BusinessConfiguration)
     app.migrations.add(CreateDeviceRegistrations())
     app.migrations.add(IndexDeviceRegistrations())
     app.migrations.add(AddBusinessDeviceAPNSEnvironment())
+    app.migrations.add(ExtendBusinessAdministration())
+    app.migrations.add(CreateAdministration())
     // Single instance: migrate on boot. Several replicas: set AUTO_MIGRATE=false
     // and run `App migrate --yes` once per deploy instead.
     if Environment.get("AUTO_MIGRATE") != "false" {
@@ -105,6 +108,20 @@ func configure(_ app: Application, businessConfiguration: BusinessConfiguration)
     app.lifecycle.use(CancelOnShutdown(task: cleanupTask))
 
     app.asyncCommands.use(PushTestCommand(), as: "push-test")
+    app.asyncCommands.use(AdminTOTPSecretCommand(), as: "admin-totp-secret")
+
+    if app.environment != .testing {
+        // Hot-linked logos from before logos were hosted: copy them once.
+        let importTask = Task { [weak app] in
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled, let app else { return }
+            await Logos.importLegacy(app: app)
+        }
+        app.lifecycle.use(CancelOnShutdown(task: importTask))
+        if businessConfiguration.isSuperAdminEnabled, businessConfiguration.adminTOTPSecret == nil {
+            app.logger.warning("ADMIN_TOTP_SECRET is not set — the admin sign-in has no second factor")
+        }
+    }
 
     try routes(app, businessConfiguration: businessConfiguration)
 }
@@ -141,6 +158,11 @@ enum Cleanup {
         let now = Date()
         try await VerificationRequest.query(on: db).filter(\.$expiresAt < now).delete()
         try await UsedNonce.query(on: db).filter(\.$expiresAt < now).delete()
+        try await OIDCLoginState.query(on: db).filter(\.$expiresAt < now).delete()
+        try await AdminSession.query(on: db).filter(\.$expiresAt < now).delete()
+        // Outbound verifications stay a day so the business can still see the answer.
+        try await OutboundVerification.query(on: db)
+            .filter(\.$expiresAt < now.addingTimeInterval(-86_400)).delete()
         try await BusinessConfirmation.query(on: db).filter(\.$expiresAt < now).delete()
         try await BusinessDeviceInvitation.query(on: db)
             .filter(\.$expiresAt < now)

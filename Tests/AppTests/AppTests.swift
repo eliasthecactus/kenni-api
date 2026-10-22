@@ -387,7 +387,7 @@ final class AppTests: XCTestCase {
             req.headers.replaceOrAdd(
                 name: "Content-Type", value: "application/x-www-form-urlencoded")
             req.body = ByteBuffer(string:
-                "csrf=\(csrfToken)&name=Acme%20AG&logoURL=https%3A%2F%2Fexample.com%2Flogo.png&address=Main%20Street%201%0A8000%20Zurich&websiteURL=https%3A%2F%2Fexample.com")
+                "csrf=\(csrfToken)&name=Acme%20AG&address=Main%20Street%201%0A8000%20Zurich&websiteURL=https%3A%2F%2Fexample.com")
         }) { res async in
             XCTAssertEqual(res.status, .seeOther)
         }

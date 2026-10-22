@@ -2,193 +2,460 @@ import Fluent
 import QRCodeGenerator
 import Vapor
 
-private struct AdminLoginForm: Content { let psk: String }
-
-private struct CreateBusinessForm: Content {
-    let name: String
-    let logoURL: String?
-    let address: String
-    let websiteURL: String?
-    let csrf: String
+private struct AdminLoginForm: Content {
+    let psk: String
+    let totp: String?
 }
 
-private struct AdminInvitationForm: Content {
+private struct BusinessProfileForm: Content {
+    let csrf: String
+    let name: String
+    let address: String
+    let websiteURL: String?
+    let logoURL: String?
+    let logo: File?
+}
+
+private struct SSOForm: Content {
+    let csrf: String
+    let action: String?
+    let slug: String?
+    let issuer: String?
+    let clientID: String?
+    let clientSecret: String?
+    let allowedEmails: String?
+}
+
+private struct InvitationForm: Content {
     let deviceLabel: String
     let csrf: String
 }
 
-private struct AdminActionForm: Content { let csrf: String }
+private struct StatusForm: Content {
+    let csrf: String
+    let status: String
+}
+
+private struct DeleteForm: Content {
+    let csrf: String
+    let confirmName: String
+}
+
+private struct CSRFForm: Content { let csrf: String }
 
 func registerAdminPortal(on app: Application, configuration: BusinessConfiguration) {
-    app.get("admin") { req async throws -> Response in
-        guard configuration.isAdminEnabled else { return adminLockedResponse() }
-        guard let session = validAdminSession(req, configuration: configuration) else {
-            return adminLoginResponse()
+    let admin = app.grouped("admin")
+    let uploads = admin.grouped(UploadLimit())
+
+    /// Runs `body` for a signed-in admin with a valid CSRF token (on POSTs).
+    @Sendable func authorized(_ req: Request, csrf: String? = nil,
+                              _ body: (AdminSession) async throws -> Response) async throws -> Response {
+        guard configuration.isAdminEnabled else { return AdminViews.locked() }
+        guard let session = try await AdminSessions.current(req) else {
+            return req.method == .GET ? loginPage() : redirect(to: "/admin")
         }
-        return try await adminDashboardResponse(req, configuration: configuration, session: session)
+        if req.method != .GET {
+            guard let csrf, timingSafeEqual(csrf, session.csrf) else { throw Abort(.forbidden) }
+        }
+        return try await body(session)
     }
 
-    app.post("admin", "login") { req -> Response in
-        guard configuration.isAdminEnabled else { return adminLockedResponse() }
-        let form = try req.content.decode(AdminLoginForm.self)
-        guard configuration.matchesAdminPSK(form.psk) else {
-            return adminLoginResponse(error: "The shared key is not valid.")
-        }
-        let session = makeAdminSession(configuration: configuration)
-        let response = redirectToAdmin()
-        response.headers.add(name: "Set-Cookie", value: adminCookie(
-            value: session, maxAge: 28_800,
-            secure: req.application.environment == .production))
-        return response
+    @Sendable func loginPage(error: String? = nil, status: HTTPResponseStatus? = nil) -> Response {
+        AdminViews.login(error: error, superAdminEnabled: configuration.isSuperAdminEnabled,
+                         totpRequired: configuration.adminTOTPSecret != nil, status: status)
     }
 
-    app.post("admin", "logout") { req -> Response in
-        let response = redirectToAdmin()
-        response.headers.add(name: "Set-Cookie", value: adminCookie(
-            value: "", maxAge: 0, secure: req.application.environment == .production))
-        return response
-    }
-
-    app.post("admin", "businesses") { req async throws -> Response in
-        guard configuration.isAdminEnabled else { return adminLockedResponse() }
-        guard let session = validAdminSession(req, configuration: configuration) else {
-            return adminLoginResponse()
-        }
-        let form = try req.content.decode(CreateBusinessForm.self)
-        guard validCSRF(form.csrf, session: session, configuration: configuration) else {
-            throw Abort(.forbidden)
-        }
-        let name = form.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let address = form.address.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, name.count <= 120, !address.isEmpty, address.count <= 500 else {
-            return try await adminDashboardResponse(
-                req, configuration: configuration, session: session,
-                error: "Enter a business name and address.")
-        }
-        let logoURL = normalizedHTTPSURL(form.logoURL)
-        let websiteURL = normalizedHTTPSURL(form.websiteURL)
-        if hasValue(form.logoURL), logoURL == nil {
-            return try await adminDashboardResponse(
-                req, configuration: configuration, session: session,
-                error: "The logo URL must be a valid HTTPS URL.")
-        }
-        if hasValue(form.websiteURL), websiteURL == nil {
-            return try await adminDashboardResponse(
-                req, configuration: configuration, session: session,
-                error: "The website URL must be a valid HTTPS URL.")
-        }
-        try await Business(name: name, logoURL: logoURL, address: address,
-                           websiteURL: websiteURL).create(on: req.db)
-        return redirectToAdmin()
-    }
-
-    app.post("admin", "businesses", ":id", "devices") { req async throws -> Response in
-        guard configuration.isAdminEnabled else { return adminLockedResponse() }
-        guard let session = validAdminSession(req, configuration: configuration) else {
-            return adminLoginResponse()
-        }
-        let form = try req.content.decode(AdminInvitationForm.self)
-        guard validCSRF(form.csrf, session: session, configuration: configuration) else {
-            throw Abort(.forbidden)
-        }
-        guard let businessID = req.parameters.get("id", as: UUID.self),
-              let business = try await Business.find(businessID, on: req.db) else {
+    @Sendable func manageableBusiness(_ req: Request, _ session: AdminSession) async throws -> Business {
+        guard let id = req.parameters.get("id", as: UUID.self),
+              session.canManage(id),
+              let business = try await Business.find(id, on: req.db) else {
             throw Abort(.notFound)
         }
-        let label = form.deviceLabel.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !label.isEmpty, label.count <= 100 else {
-            return try await adminDashboardResponse(
-                req, configuration: configuration, session: session,
-                error: "Enter a device label.")
-        }
-        let invitationID = UUID()
-        let secret = randomBusinessToken()
-        let token = "\(invitationID.uuidString).\(secret)"
-        guard let digest = configuration.digest(context: "business-invitation", value: token) else {
-            throw Abort(.serviceUnavailable)
-        }
-        let expiresAt = Date().addingTimeInterval(7 * 86_400)
-        try await BusinessDeviceInvitation(
-            id: invitationID, businessID: businessID, deviceLabel: label,
-            tokenDigest: digest, expiresAt: expiresAt).create(on: req.db)
-        let enrollmentURL = "kenni://business/enroll?token=\(token)"
-        let svg = try QRCode.encode(text: enrollmentURL, ecl: .medium).toSVGString(border: 4)
-        return adminInvitationResponse(
-            business: business, label: label, enrollmentURL: enrollmentURL,
-            expiresAt: expiresAt, qrSVG: svg)
+        return business
     }
 
-    app.post("admin", "businesses", ":id", "devices", ":deviceID", "revoke") { req async throws -> Response in
-        guard configuration.isAdminEnabled else { return adminLockedResponse() }
-        guard let session = validAdminSession(req, configuration: configuration) else {
-            return adminLoginResponse()
+    @Sendable func requireSuper(_ session: AdminSession) throws {
+        guard session.isSuper else { throw Abort(.forbidden) }
+    }
+
+    @Sendable func dashboard(_ req: Request, _ session: AdminSession,
+                             error: String? = nil) async throws -> Response {
+        var query = Business.query(on: req.db).sort(\.$name)
+        if !session.isSuper, let businessID = session.businessID {
+            query = query.filter(\.$id == businessID)
         }
-        let form = try req.content.decode(AdminActionForm.self)
-        guard validCSRF(form.csrf, session: session, configuration: configuration) else {
-            throw Abort(.forbidden)
+        var cards: [AdminViews.BusinessCard] = []
+        for business in try await query.all() {
+            let businessID = try business.requireID()
+            cards.append(AdminViews.BusinessCard(
+                business: business,
+                hasLogo: try await BusinessLogo.find(businessID, on: req.db) != nil,
+                devices: try await BusinessDevice.query(on: req.db)
+                    .filter(\.$businessID == businessID).sort(\.$deviceLabel).all(),
+                invitations: try await BusinessDeviceInvitation.query(on: req.db)
+                    .filter(\.$businessID == businessID)
+                    .filter(\.$claimedAt == nil)
+                    .filter(\.$expiresAt > Date())
+                    .sort(\.$createdAt).all()))
         }
-        guard let businessID = req.parameters.get("id", as: UUID.self),
-              let deviceID = req.parameters.get("deviceID", as: UUID.self),
-              let device = try await BusinessDevice.find(deviceID, on: req.db),
-              device.businessID == businessID else { throw Abort(.notFound) }
-        if device.revokedAt == nil {
-            device.revokedAt = .now
-            try await device.save(on: req.db)
-            await PushService.sendBusinessRevocation(to: device, on: req)
+        var audit = AuditEvent.query(on: req.db).sort(\.$at, .descending).limit(50)
+        if !session.isSuper, let businessID = session.businessID {
+            audit = audit.filter(\.$businessID == businessID)
         }
-        return redirectToAdmin()
+        return AdminViews.dashboard(session: session, cards: cards, audit: try await audit.all(),
+                                    error: error)
+    }
+
+    // MARK: Sign-in
+
+    admin.get { req async throws -> Response in
+        try await authorized(req) { session in try await dashboard(req, session) }
+    }
+
+    admin.grouped(RateLimitMiddleware(store: app.rateLimits.adminLogin))
+        .post("login") { req async throws -> Response in
+            guard configuration.isSuperAdminEnabled else { return AdminViews.locked() }
+            let form = try req.content.decode(AdminLoginForm.self)
+            guard configuration.matchesAdminPSK(form.psk) else {
+                await Audit.record(req, actor: "unknown", action: "admin.sign_in_failed")
+                return loginPage(error: "The shared key or code is not valid.")
+            }
+            if let secret = configuration.adminTOTPSecret {
+                let valid = (try? await TOTP.verify(form.totp ?? "", secretBase32: secret,
+                                                     on: req.db)) ?? false
+                guard valid else {
+                    await Audit.record(req, actor: "admin", action: "admin.totp_failed")
+                    return loginPage(error: "The shared key or code is not valid.")
+                }
+            }
+            return try await AdminSessions.start(req, actor: "admin", role: .superAdmin,
+                                                 businessID: nil)
+        }
+
+    admin.post("logout") { req async throws -> Response in
+        try await AdminSessions.end(req)
+    }
+
+    admin.post("sessions", "revoke-all") { req async throws -> Response in
+        let form = try req.content.decode(CSRFForm.self)
+        return try await authorized(req, csrf: form.csrf) { session in
+            try requireSuper(session)
+            try await AdminSessions.revokeAll(except: session, on: req.db)
+            await Audit.record(req, actor: session.actor, action: "admin.sessions_revoked")
+            return redirect(to: "/admin")
+        }
+    }
+
+    // MARK: Company sign-in (SSO)
+
+    admin.get("sso") { req async throws -> Response in
+        let org = (req.query[String.self, at: "org"] ?? "").lowercased()
+            .trimmingCharacters(in: .whitespaces)
+        guard org.range(of: "^[a-z0-9-]{2,40}$", options: .regularExpression) != nil else {
+            return loginPage(error: "Enter your organisation ID.", status: .badRequest)
+        }
+        return redirect(to: "/admin/sso/\(org)")
+    }
+
+    admin.get("sso", "callback") { req async throws -> Response in
+        guard configuration.isAdminEnabled else { return AdminViews.locked() }
+        if req.query[String.self, at: "error"] != nil {
+            return loginPage(error: "Company sign-in was cancelled.", status: .unauthorized)
+        }
+        do {
+            let (business, email) = try await SSO.complete(req, configuration: configuration)
+            return try await AdminSessions.start(req, actor: email, role: .business,
+                                                 businessID: business.requireID())
+        } catch let error as any AbortError {
+            return loginPage(error: error.reason, status: error.status)
+        }
+    }
+
+    admin.get("sso", ":slug") { req async throws -> Response in
+        guard configuration.isAdminEnabled else { return AdminViews.locked() }
+        let slug = try req.parameters.require("slug")
+        guard let business = try await Business.query(on: req.db)
+            .filter(\.$slug == slug).first(), business.isSSOConfigured,
+              business.status == .active else {
+            return loginPage(error: "Company sign-in isn't set up for this organisation.",
+                             status: .notFound)
+        }
+        do {
+            return try await SSO.begin(req, business: business, configuration: configuration)
+        } catch let error as any AbortError {
+            return loginPage(error: error.reason, status: error.status)
+        }
+    }
+
+    // MARK: Businesses (super admin)
+
+    uploads.post("businesses") { req async throws -> Response in
+        let form = try req.content.decode(BusinessProfileForm.self)
+        return try await authorized(req, csrf: form.csrf) { session in
+            try requireSuper(session)
+            let business = Business(name: "", address: "", websiteURL: nil)
+            if let problem = try await apply(form, to: business, req: req) {
+                return try await dashboard(req, session, error: problem)
+            }
+            await Audit.record(req, actor: session.actor, action: "business.approved",
+                               businessID: business.id, target: business.name)
+            return redirect(to: "/admin")
+        }
+    }
+
+    admin.get("businesses", ":id") { req async throws -> Response in
+        try await authorized(req) { session in
+            try requireSuper(session)
+            let business = try await manageableBusiness(req, session)
+            return AdminViews.editBusiness(
+                session: session, business: business,
+                hasLogo: try await BusinessLogo.find(business.requireID(), on: req.db) != nil)
+        }
+    }
+
+    uploads.post("businesses", ":id") { req async throws -> Response in
+        let form = try req.content.decode(BusinessProfileForm.self)
+        return try await authorized(req, csrf: form.csrf) { session in
+            try requireSuper(session)
+            let business = try await manageableBusiness(req, session)
+            if let problem = try await apply(form, to: business, req: req) {
+                return AdminViews.editBusiness(
+                    session: session, business: business,
+                    hasLogo: try await BusinessLogo.find(business.requireID(), on: req.db) != nil,
+                    error: problem)
+            }
+            await Audit.record(req, actor: session.actor, action: "business.updated",
+                               businessID: business.id, target: business.name)
+            return redirect(to: "/admin")
+        }
+    }
+
+    admin.post("businesses", ":id", "sso") { req async throws -> Response in
+        let form = try req.content.decode(SSOForm.self)
+        return try await authorized(req, csrf: form.csrf) { session in
+            try requireSuper(session)
+            let business = try await manageableBusiness(req, session)
+            let hasLogo = try await BusinessLogo.find(business.requireID(), on: req.db) != nil
+            func fail(_ message: String) -> Response {
+                AdminViews.editBusiness(session: session, business: business, hasLogo: hasLogo,
+                                        error: message)
+            }
+            if form.action == "remove" {
+                business.ssoIssuer = nil
+                business.ssoClientID = nil
+                business.ssoClientSecretSealed = nil
+                try await business.save(on: req.db)
+                await Audit.record(req, actor: session.actor, action: "business.sso_removed",
+                                   businessID: business.id, target: business.name)
+                return redirect(to: "/admin/businesses/\(try business.requireID())")
+            }
+            let slug = (form.slug ?? "").lowercased().trimmingCharacters(in: .whitespaces)
+            guard slug.range(of: "^[a-z0-9-]{2,40}$", options: .regularExpression) != nil else {
+                return fail("The organisation ID must be 2–40 lowercase letters, digits or dashes.")
+            }
+            if let other = try await Business.query(on: req.db).filter(\.$slug == slug).first(),
+               other.id != business.id {
+                return fail("Another business already uses this organisation ID.")
+            }
+            guard let issuer = form.issuer?.trimmingCharacters(in: .whitespaces),
+                  issuer.hasPrefix("https://"), URL(string: issuer)?.host != nil else {
+                return fail("The issuer must be an HTTPS URL.")
+            }
+            guard let clientID = form.clientID?.trimmingCharacters(in: .whitespaces),
+                  !clientID.isEmpty, clientID.count <= 200 else {
+                return fail("Enter the client ID.")
+            }
+            let allowed = (form.allowedEmails ?? "").trimmingCharacters(in: .whitespaces)
+            guard !allowed.isEmpty, allowed.contains("@") else {
+                return fail("List at least one allowed address or @domain.")
+            }
+            guard configuration.publicBaseURL != nil else {
+                return fail("Set PUBLIC_BASE_URL on the API first (needed for the redirect URI).")
+            }
+            if let secret = form.clientSecret, !secret.isEmpty {
+                guard let sealed = configuration.seal(secret) else { throw Abort(.internalServerError) }
+                business.ssoClientSecretSealed = sealed
+            } else if business.ssoClientSecretSealed == nil {
+                return fail("Enter the client secret.")
+            }
+            do {
+                _ = try await SSO.discover(issuer: issuer, on: req)
+            } catch {
+                return fail("The issuer's OpenID configuration could not be loaded.")
+            }
+            business.slug = slug
+            business.ssoIssuer = issuer
+            business.ssoClientID = clientID
+            business.ssoAllowedEmails = allowed
+            try await business.save(on: req.db)
+            await Audit.record(req, actor: session.actor, action: "business.sso_configured",
+                               businessID: business.id, target: business.name, detail: allowed)
+            return redirect(to: "/admin")
+        }
+    }
+
+    admin.post("businesses", ":id", "status") { req async throws -> Response in
+        let form = try req.content.decode(StatusForm.self)
+        return try await authorized(req, csrf: form.csrf) { session in
+            try requireSuper(session)
+            let business = try await manageableBusiness(req, session)
+            guard let status = Business.Status(rawValue: form.status) else {
+                throw Abort(.badRequest)
+            }
+            business.status = status
+            try await business.save(on: req.db)
+            await Audit.record(req, actor: session.actor,
+                               action: status == .active ? "business.reactivated" : "business.suspended",
+                               businessID: business.id, target: business.name)
+            return redirect(to: "/admin")
+        }
+    }
+
+    admin.post("businesses", ":id", "delete") { req async throws -> Response in
+        let form = try req.content.decode(DeleteForm.self)
+        return try await authorized(req, csrf: form.csrf) { session in
+            try requireSuper(session)
+            let business = try await manageableBusiness(req, session)
+            guard form.confirmName.trimmingCharacters(in: .whitespaces) == business.name else {
+                return AdminViews.editBusiness(
+                    session: session, business: business,
+                    hasLogo: try await BusinessLogo.find(business.requireID(), on: req.db) != nil,
+                    error: "The name didn't match — nothing was deleted.")
+            }
+            let businessID = try business.requireID()
+            try await req.db.transaction { db in
+                // Children first: SQLite doesn't enforce the cascades.
+                let devices = try await BusinessDevice.query(on: db)
+                    .filter(\.$businessID == businessID).all()
+                for device in devices {
+                    let deviceID = try device.requireID()
+                    try await BusinessConfirmation.query(on: db)
+                        .filter(\.$businessDeviceID == deviceID).delete()
+                    try await OutboundVerification.query(on: db)
+                        .filter(\.$businessDeviceID == deviceID).delete()
+                    try await device.delete(on: db)
+                }
+                try await BusinessDeviceInvitation.query(on: db)
+                    .filter(\.$businessID == businessID).delete()
+                try await BusinessLogo.query(on: db).filter(\.$id == businessID).delete()
+                try await AdminSession.query(on: db).filter(\.$businessID == businessID).delete()
+                try await OIDCLoginState.query(on: db).filter(\.$businessID == businessID).delete()
+                try await business.delete(on: db)
+            }
+            await Audit.record(req, actor: session.actor, action: "business.deleted",
+                               businessID: businessID, target: business.name)
+            return redirect(to: "/admin")
+        }
+    }
+
+    // MARK: Devices (super admin, or the business's own admins)
+
+    admin.post("businesses", ":id", "devices") { req async throws -> Response in
+        let form = try req.content.decode(InvitationForm.self)
+        return try await authorized(req, csrf: form.csrf) { session in
+            let business = try await manageableBusiness(req, session)
+            guard business.status == .active else {
+                return try await dashboard(req, session, error: "Reactivate the business first.")
+            }
+            let label = form.deviceLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !label.isEmpty, label.count <= 100 else {
+                return try await dashboard(req, session, error: "Enter a device label.")
+            }
+            let invitationID = UUID()
+            let token = "\(invitationID.uuidString).\(randomBusinessToken())"
+            guard let digest = configuration.digest(context: "business-invitation", value: token) else {
+                throw Abort(.serviceUnavailable)
+            }
+            let expiresAt = Date().addingTimeInterval(7 * 86_400)
+            try await BusinessDeviceInvitation(
+                id: invitationID, businessID: business.requireID(), deviceLabel: label,
+                tokenDigest: digest, expiresAt: expiresAt).create(on: req.db)
+            await Audit.record(req, actor: session.actor, action: "device.invited",
+                               businessID: business.id, target: label)
+            let enrollmentURL = "kenni://business/enroll?token=\(token)"
+            let svg = try QRCode.encode(text: enrollmentURL, ecl: .medium).toSVGString(border: 4)
+            return AdminViews.invitation(business: business, label: label,
+                                         enrollmentURL: enrollmentURL, expiresAt: expiresAt,
+                                         qrSVG: svg)
+        }
+    }
+
+    admin.post("businesses", ":id", "devices", ":deviceID", "revoke") { req async throws -> Response in
+        let form = try req.content.decode(CSRFForm.self)
+        return try await authorized(req, csrf: form.csrf) { session in
+            let business = try await manageableBusiness(req, session)
+            guard let deviceID = req.parameters.get("deviceID", as: UUID.self),
+                  let device = try await BusinessDevice.find(deviceID, on: req.db),
+                  device.businessID == (try business.requireID()) else { throw Abort(.notFound) }
+            if device.revokedAt == nil {
+                device.revokedAt = .now
+                try await device.save(on: req.db)
+                await Audit.record(req, actor: session.actor, action: "device.revoked",
+                                   businessID: business.id, target: device.deviceLabel)
+                await PushService.sendBusinessRevocation(to: device, on: req)
+            }
+            return redirect(to: "/admin")
+        }
+    }
+
+    admin.post("businesses", ":id", "invitations", ":invitationID", "cancel") { req async throws -> Response in
+        let form = try req.content.decode(CSRFForm.self)
+        return try await authorized(req, csrf: form.csrf) { session in
+            let business = try await manageableBusiness(req, session)
+            guard let invitationID = req.parameters.get("invitationID", as: UUID.self),
+                  let invitation = try await BusinessDeviceInvitation.find(invitationID, on: req.db),
+                  invitation.businessID == (try business.requireID()),
+                  invitation.claimedAt == nil else { throw Abort(.notFound) }
+            try await invitation.delete(on: req.db)
+            await Audit.record(req, actor: session.actor, action: "device.invitation_cancelled",
+                               businessID: business.id, target: invitation.deviceLabel)
+            return redirect(to: "/admin")
+        }
     }
 }
 
-private func makeAdminSession(configuration: BusinessConfiguration) -> String {
-    let expiration = Int(Date().addingTimeInterval(28_800).timeIntervalSince1970)
-    let nonce = randomBusinessToken()
-    let payload = "\(expiration).\(nonce)"
-    let signature = BusinessConfiguration.hmacHex(
-        message: "kenni/admin-session/v1\n\(payload)", secret: configuration.adminPSK!)
-    return "\(payload).\(signature)"
-}
+/// Validates and stores a profile form. Returns a message for the admin, or nil.
+private func apply(_ form: BusinessProfileForm, to business: Business,
+                   req: Request) async throws -> String? {
+    let name = form.name.trimmingCharacters(in: .whitespacesAndNewlines)
+    let address = form.address.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !name.isEmpty, name.count <= 120, !address.isEmpty, address.count <= 500 else {
+        return "Enter a business name and address."
+    }
+    let websiteURL = normalizedHTTPSURL(form.websiteURL)
+    if hasValue(form.websiteURL), websiteURL == nil {
+        return "The website URL must be a valid HTTPS URL."
+    }
 
-private func validAdminSession(_ req: Request, configuration: BusinessConfiguration) -> String? {
-    guard let secret = configuration.adminPSK,
-          let session = requestCookie(named: "kenni_admin", from: req),
-          session.count <= 240 else { return nil }
-    let parts = session.split(separator: ".", omittingEmptySubsequences: false)
-    guard parts.count == 3, let expiration = TimeInterval(parts[0]),
-          expiration > Date().timeIntervalSince1970 else { return nil }
-    let payload = "\(parts[0]).\(parts[1])"
-    let expected = BusinessConfiguration.hmacHex(
-        message: "kenni/admin-session/v1\n\(payload)", secret: secret)
-    guard timingSafeEqual(String(parts[2]), expected) else { return nil }
-    return session
-}
+    var logo: (data: Data, contentType: String)?
+    if let file = form.logo, file.data.readableBytes > 0 {
+        guard let image = Logos.validate(Data(buffer: file.data)) else {
+            return "The logo must be a PNG or JPEG of at most 512 KB."
+        }
+        logo = image
+    } else if hasValue(form.logoURL) {
+        guard let url = normalizedHTTPSURL(form.logoURL) else {
+            return "The logo URL must be a valid HTTPS URL."
+        }
+        guard let image = await Logos.download(url, on: req.client) else {
+            return "The logo couldn't be downloaded (PNG or JPEG, at most 512 KB)."
+        }
+        logo = image
+    }
 
-private func csrfToken(session: String, configuration: BusinessConfiguration) -> String {
-    BusinessConfiguration.hmacHex(
-        message: "kenni/admin-csrf/v1\n\(session)", secret: configuration.adminPSK!)
-}
-
-private func validCSRF(_ candidate: String, session: String,
-                       configuration: BusinessConfiguration) -> Bool {
-    timingSafeEqual(candidate, csrfToken(session: session, configuration: configuration))
-}
-
-private func requestCookie(named name: String, from req: Request) -> String? {
-    req.headers.first(name: "Cookie")?.split(separator: ";").lazy
-        .map { $0.trimmingCharacters(in: .whitespaces) }
-        .first { $0.hasPrefix("\(name)=") }
-        .map { String($0.dropFirst(name.count + 1)) }
-}
-
-private func adminCookie(value: String, maxAge: Int, secure: Bool) -> String {
-    "kenni_admin=\(value); Path=/admin; Max-Age=\(maxAge); HttpOnly; SameSite=Strict"
-        + (secure ? "; Secure" : "")
-}
-
-private func redirectToAdmin() -> Response {
-    let response = Response(status: .seeOther)
-    response.headers.replaceOrAdd(name: "Location", value: "/admin")
-    return response
+    business.name = name
+    business.address = address
+    business.websiteURL = websiteURL
+    try await business.save(on: req.db)
+    if let logo {
+        let businessID = try business.requireID()
+        try await BusinessLogo.query(on: req.db).filter(\.$id == businessID).delete()
+        try await BusinessLogo(businessID: businessID, contentType: logo.contentType,
+                               data: logo.data).create(on: req.db)
+        business.logoURL = nil
+        try await business.save(on: req.db)
+    }
+    return nil
 }
 
 private func normalizedHTTPSURL(_ raw: String?) -> String? {
@@ -203,117 +470,52 @@ private func hasValue(_ raw: String?) -> Bool {
     !(raw?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
 }
 
-private func adminLockedResponse() -> Response {
-    adminPage(title: "Admin locked", status: .serviceUnavailable, content: """
-    <main class="center"><section class="panel narrow"><div class="mark">K</div>
-    <h1>Admin access is locked</h1><p>Set both <code>ADMIN_PSK</code> and
-    <code>BUSINESS_TOKEN_SECRET</code>, then restart the API.</p></section></main>
-    """)
-}
-
-private func adminLoginResponse(error: String? = nil) -> Response {
-    let notice = error.map { "<p class=\"error\">\(htmlEscape($0))</p>" } ?? ""
-    return adminPage(title: "Admin sign in", status: error == nil ? .unauthorized : .forbidden,
-                     content: """
-    <main class="center"><section class="panel narrow"><div class="mark">K</div>
-    <p class="eyebrow">KENNI ADMIN</p><h1>Approved businesses</h1>
-    <p>Enter the shared key configured on the API.</p>\(notice)
-    <form method="post" action="/admin/login"><label>Shared key
-    <input type="password" name="psk" required autofocus autocomplete="current-password"></label>
-    <button type="submit">Sign in</button></form></section></main>
-    """)
-}
-
-private func adminDashboardResponse(_ req: Request, configuration: BusinessConfiguration,
-                                    session: String, error: String? = nil) async throws -> Response {
-    let businesses = try await Business.query(on: req.db).sort(\.$name).all()
-    let csrf = csrfToken(session: session, configuration: configuration)
-    var directory = ""
-    for business in businesses {
-        let businessID = try business.requireID()
-        let devices = try await BusinessDevice.query(on: req.db)
-            .filter(\.$businessID == businessID).sort(\.$deviceLabel).all()
-        let pending = try await BusinessDeviceInvitation.query(on: req.db)
-            .filter(\.$businessID == businessID)
-            .filter(\.$claimedAt == nil)
-            .filter(\.$expiresAt > Date())
-            .count()
-        let logo = business.logoURL.map {
-            "<img src=\"\(htmlEscape($0))\" alt=\"\(htmlEscape(business.name)) logo\">"
-        } ?? "<div class=\"logo-placeholder\">\(htmlEscape(String(business.name.prefix(1)).uppercased()))</div>"
-        var deviceRows: String = devices.map { device -> String in
-            let revoked = device.revokedAt != nil
-            let status = revoked ? "Revoked" : "Active"
-            let action = revoked ? "" : """
-            <form method="post" action="/admin/businesses/\(businessID)/devices/\(device.id!.uuidString)/revoke">
-            <input type="hidden" name="csrf" value="\(csrf)"><button class="danger small" type="submit">Revoke</button></form>
-            """
-            return """
-            <div class="device-row"><div><strong>\(htmlEscape(device.deviceLabel))</strong>
-            <span class="status \(revoked ? "revoked" : "active")">\(status)</span>
-            <small>\(device.lastSeenAt.map { "Last seen \($0.formatted())" } ?? "Not seen since enrollment")</small></div>\(action)</div>
-            """
-        }.joined(separator: "\n")
-        if deviceRows.isEmpty { deviceRows = "<p class=\"muted\">No enrolled devices.</p>" }
-        directory += """
-        <article class="business-card"><div class="business-head">\(logo)<div><h3>\(htmlEscape(business.name))</h3>
-        <p>\(htmlEscape(business.address).replacingOccurrences(of: "\n", with: "<br>"))</p>
-        <span class="muted">\(devices.filter { $0.revokedAt == nil }.count) active · \(pending) pending</span></div></div>
-        <div class="devices">\(deviceRows)</div>
-        <form class="invite-form" method="post" action="/admin/businesses/\(businessID)/devices">
-        <input type="hidden" name="csrf" value="\(csrf)"><label>New device label
-        <input name="deviceLabel" maxlength="100" placeholder="Reception iPad" required></label>
-        <button type="submit">Create enrollment QR</button></form></article>
-        """
+/// Lets logo uploads through the 2 MB global cap but no further.
+private struct UploadLimit: AsyncMiddleware {
+    func respond(to request: Request, chainingTo next: any AsyncResponder) async throws -> Response {
+        if let length = request.headers.first(name: .contentLength).flatMap(Int.init),
+           length > 1_048_576 {
+            throw Abort(.payloadTooLarge)
+        }
+        return try await next.respond(to: request)
     }
-    if directory.isEmpty { directory = "<div class=\"empty\">No approved businesses yet.</div>" }
-    let notice = error.map { "<p class=\"error\">\(htmlEscape($0))</p>" } ?? ""
-    return adminPage(title: "Approved businesses", status: error == nil ? .ok : .badRequest,
-                     content: """
-    <header><div><p class="eyebrow">KENNI ADMIN</p><h1>Approved businesses</h1></div>
-    <form method="post" action="/admin/logout"><button class="quiet" type="submit">Sign out</button></form></header>
-    <main class="layout"><section class="panel"><h2>Add a business</h2>\(notice)
-    <form method="post" action="/admin/businesses"><input type="hidden" name="csrf" value="\(csrf)">
-    <label>Business name<input name="name" maxlength="120" required></label>
-    <label>Logo URL <span>optional, HTTPS</span><input type="url" name="logoURL" maxlength="500" placeholder="https://…"></label>
-    <label>Address<textarea name="address" maxlength="500" rows="4" required></textarea></label>
-    <label>Website <span>optional, HTTPS</span><input type="url" name="websiteURL" maxlength="500" placeholder="https://…"></label>
-    <button type="submit">Approve business</button></form></section>
-    <section><div class="section-title"><h2>Directory</h2><span>\(businesses.count)</span></div>\(directory)</section></main>
-    """)
 }
 
-private func adminInvitationResponse(business: Business, label: String, enrollmentURL: String,
-                                     expiresAt: Date, qrSVG: String) -> Response {
-    adminPage(title: "Enroll \(label)", status: .created, content: """
-    <main class="center"><section class="panel enrollment"><p class="eyebrow">ONE-TIME ENROLLMENT</p>
-    <h1>\(htmlEscape(business.name))</h1><h2>\(htmlEscape(label))</h2>
-    <p>Open KENNI on the business device and scan this QR during setup. It expires
-    \(htmlEscape(expiresAt.formatted())) and can be claimed once.</p>
-    <div class="qr">\(qrSVG)</div><label>Enrollment link
-    <textarea readonly rows="4">\(htmlEscape(enrollmentURL))</textarea></label>
-    <p class="warning">This link is a one-time secret. Share it only with the intended device.</p>
-    <a class="button-link" href="/admin">Back to businesses</a></section></main>
-    """)
-}
+enum Logos {
+    static let maxBytes = 512 * 1024
 
-private func adminPage(title: String, status: HTTPResponseStatus, content: String) -> Response {
-    let document = """
-    <!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>\(htmlEscape(title)) · KENNI</title><style>
-    :root{color-scheme:dark;--bg:#080b12;--panel:#111722;--line:#263145;--text:#f6f8fc;--muted:#9aa6b8;--blue:#6ba8ff;--cyan:#57e2d2;--danger:#ff7f87}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 15% 0,#12233d 0,transparent 32rem),var(--bg);color:var(--text);font:15px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh}header{max-width:1180px;margin:auto;padding:40px 24px 20px;display:flex;justify-content:space-between;align-items:center}.eyebrow{letter-spacing:.18em;color:var(--cyan);font-size:12px;font-weight:700;margin:0 0 6px}h1,h2,h3{margin:0}p{color:var(--muted);line-height:1.5}.layout{max-width:1180px;margin:auto;padding:20px 24px 64px;display:grid;grid-template-columns:minmax(280px,360px) 1fr;gap:32px;align-items:start}.panel,.business-card,.empty{background:color-mix(in srgb,var(--panel) 92%,transparent);border:1px solid var(--line);border-radius:20px;padding:24px;box-shadow:0 20px 60px #0005}.narrow{width:min(440px,calc(100vw - 32px))}.center{display:grid;place-items:center;min-height:100vh;padding:16px}.mark{width:48px;height:48px;border-radius:15px;background:linear-gradient(135deg,var(--blue),var(--cyan));display:grid;place-items:center;color:#08101c;font-size:24px;font-weight:900;margin-bottom:22px}label{display:grid;gap:8px;margin-top:18px;font-weight:600}label span,.muted,small{color:var(--muted);font-size:12px;font-weight:400}input,textarea{width:100%;background:#090e17;color:var(--text);border:1px solid var(--line);border-radius:12px;padding:12px 13px;font:inherit;resize:vertical}input:focus,textarea:focus{outline:2px solid var(--blue);border-color:transparent}button,.button-link{border:0;border-radius:12px;background:var(--text);color:#0a1019;padding:12px 16px;font:inherit;font-weight:700;cursor:pointer;margin-top:20px;width:100%;text-align:center;text-decoration:none;display:block}.quiet{width:auto;margin:0;background:#ffffff10;color:var(--text);border:1px solid var(--line)}.danger{background:transparent;color:var(--danger);border:1px solid #ff7f8740}.small{width:auto;margin:0;padding:7px 10px}.error,.warning{padding:11px 13px;border-radius:10px;background:#ff7f8716;color:#ffabb0;border:1px solid #ff7f8730}.section-title{display:flex;align-items:center;gap:10px;margin-bottom:14px}.section-title span{background:#ffffff12;color:var(--muted);border-radius:999px;padding:3px 9px}.business-card{margin-bottom:16px;padding:18px}.business-head{display:grid;grid-template-columns:56px 1fr;gap:16px;align-items:center}.business-head img,.logo-placeholder{width:56px;height:56px;object-fit:contain;border-radius:14px;background:#fff}.logo-placeholder{display:grid;place-items:center;color:#0a1019;font-size:24px;font-weight:800;background:linear-gradient(135deg,var(--blue),var(--cyan))}.business-head p{margin:4px 0;font-size:13px}.devices{margin-top:18px;border-top:1px solid var(--line)}.device-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 0;border-bottom:1px solid var(--line)}.device-row strong,.device-row small{display:block}.status{display:inline-block;margin-left:8px;padding:2px 7px;border-radius:999px;font-size:11px}.active{color:var(--cyan);background:#57e2d218}.revoked{color:var(--danger);background:#ff7f8718}.invite-form{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end}.invite-form label{margin-top:16px}.invite-form button{width:auto;margin:0}.enrollment{width:min(560px,calc(100vw - 32px));text-align:center}.enrollment label{text-align:left}.qr{background:#fff;border-radius:18px;padding:16px;margin:24px auto;width:min(320px,100%)}.qr svg{display:block;width:100%;height:auto}@media(max-width:760px){.layout{grid-template-columns:1fr}.invite-form{grid-template-columns:1fr}.invite-form button{width:100%}}
-    </style></head><body>\(content)</body></html>
-    """
-    var headers = HTTPHeaders()
-    headers.replaceOrAdd(name: "Content-Type", value: "text/html; charset=utf-8")
-    headers.replaceOrAdd(name: "Cache-Control", value: "no-store")
-    return Response(status: status, headers: headers, body: .init(string: document))
-}
+    /// PNG or JPEG by magic number, within the size cap.
+    static func validate(_ data: Data) -> (data: Data, contentType: String)? {
+        guard !data.isEmpty, data.count <= maxBytes else { return nil }
+        if data.starts(with: [0x89, 0x50, 0x4E, 0x47]) { return (data, "image/png") }
+        if data.starts(with: [0xFF, 0xD8, 0xFF]) { return (data, "image/jpeg") }
+        return nil
+    }
 
-private func htmlEscape(_ value: String) -> String {
-    value.replacingOccurrences(of: "&", with: "&amp;")
-        .replacingOccurrences(of: "<", with: "&lt;")
-        .replacingOccurrences(of: ">", with: "&gt;")
-        .replacingOccurrences(of: "\"", with: "&quot;")
-        .replacingOccurrences(of: "'", with: "&#39;")
+    static func download(_ url: String, on client: any Client) async -> (data: Data, contentType: String)? {
+        guard url.hasPrefix("https://"),
+              let response = try? await client.get(URI(string: url)),
+              response.status == .ok, let body = response.body,
+              body.readableBytes <= maxBytes else { return nil }
+        return validate(Data(buffer: body))
+    }
+
+    /// Copies hot-linked logos from before hosted logos existed, once.
+    static func importLegacy(app: Application) async {
+        guard let businesses = try? await Business.query(on: app.db)
+            .filter(\.$logoURL != nil).all() else { return }
+        for business in businesses {
+            guard let id = business.id, let url = business.logoURL else { continue }
+            if let image = await download(url, on: app.client) {
+                try? await BusinessLogo.query(on: app.db).filter(\.$id == id).delete()
+                try? await BusinessLogo(businessID: id, contentType: image.contentType,
+                                        data: image.data).create(on: app.db)
+                business.logoURL = nil
+                try? await business.save(on: app.db)
+                app.logger.info("imported legacy logo for \(business.name)")
+            } else {
+                app.logger.warning("could not import legacy logo for \(business.name)")
+            }
+        }
+    }
 }
