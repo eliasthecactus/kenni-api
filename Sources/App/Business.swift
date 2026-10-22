@@ -303,24 +303,21 @@ struct VerifyBusinessPINDTO: Content {
 }
 
 struct BusinessDeviceAuth {
-    static func verify(_ req: Request, body: ByteBuffer?, allowRevoked: Bool = false) async throws -> BusinessDevice {
+    /// Same envelope as `KenniAuth` (see `SignedRequest`), with the context
+    /// `business-device` and the device id as the signer.
+    static func verify(_ req: Request, allowRevoked: Bool = false) async throws -> BusinessDevice {
         guard let idRaw = req.headers.first(name: "X-Kenni-Business-Device"),
               let id = UUID(uuidString: idRaw),
-              let timestampRaw = req.headers.first(name: "X-Kenni-Business-Timestamp"),
-              let timestamp = Double(timestampRaw),
-              abs(Date().timeIntervalSince1970 - timestamp) <= 300,
-              let signatureRaw = req.headers.first(name: "X-Kenni-Business-Signature"),
-              let signature = Data(base64URLEncoded: signatureRaw),
               let device = try await BusinessDevice.find(id, on: req.db),
               let keyData = Data(base64URLEncoded: device.publicKey),
               let key = try? Curve25519.Signing.PublicKey(rawRepresentation: keyData) else {
             throw Abort(.unauthorized, reason: "missing or invalid business device authentication")
         }
-        let bodyString = body.map(String.init(buffer:)) ?? ""
-        let message = Data("kenni/v1/business-device\n\(req.method.rawValue)\n\(req.url.path)\n\(timestampRaw)\n\(bodyString)".utf8)
-        guard key.isValidSignature(signature, for: message) else {
-            throw Abort(.unauthorized, reason: "invalid business device signature")
-        }
+        try await SignedRequest.verify(
+            req, context: "business-device", signer: idRaw.uppercased(), publicKey: key,
+            timestampHeader: "X-Kenni-Business-Timestamp",
+            signatureHeader: "X-Kenni-Business-Signature")
+        try await req.enforce(req.application.rateLimits.perKey, key: "business:\(id)")
         guard allowRevoked || device.revokedAt == nil else {
             throw Abort(.gone, reason: "business device revoked")
         }

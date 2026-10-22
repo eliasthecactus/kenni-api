@@ -28,8 +28,7 @@ struct BackupDTO: Content {
     let blob: String
 }
 
-func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
-            businessLookupLimiter: RateLimiterStore) throws {
+func routes(_ app: Application, businessConfiguration: BusinessConfiguration) throws {
     app.get("health") { _ in
         ["status": "ok"]
     }
@@ -37,9 +36,9 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
 
     let v1 = app.grouped("v1")
     let businessEnrollmentRoutes = v1.grouped("business-device-invitations")
-        .grouped(RateLimitMiddleware(store: businessLookupLimiter))
+        .grouped(RateLimitMiddleware(store: app.rateLimits.businessLookup))
     let businessVerificationRoutes = v1.grouped("business-verifications")
-        .grouped(RateLimitMiddleware(store: businessLookupLimiter))
+        .grouped(RateLimitMiddleware(store: app.rateLimits.businessLookup))
 
     // A one-time administrator invitation binds a freshly-generated device key
     // to a business. The invitation token is never retained in plaintext.
@@ -99,8 +98,7 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
     let businessDevices = v1.grouped("business-devices")
 
     businessDevices.get("me") { req async throws -> BusinessDeviceStatusDTO in
-        let device = try await BusinessDeviceAuth.verify(
-            req, body: req.body.data, allowRevoked: true)
+        let device = try await BusinessDeviceAuth.verify(req, allowRevoked: true)
         guard let business = try await Business.find(device.businessID, on: req.db) else {
             throw Abort(.gone)
         }
@@ -116,7 +114,7 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
     }
 
     businessDevices.put("apns-token") { req async throws -> HTTPStatus in
-        let device = try await BusinessDeviceAuth.verify(req, body: req.body.data)
+        let device = try await BusinessDeviceAuth.verify(req)
         let dto = try req.content.decode(BusinessDeviceAPNSDTO.self)
         guard (32...512).contains(dto.apnsToken.count),
               dto.apnsToken.allSatisfy(\.isHexDigit) else {
@@ -132,7 +130,7 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
         guard businessConfiguration.businessSecret != nil else {
             throw Abort(.serviceUnavailable, reason: "business verification is not configured")
         }
-        let device = try await BusinessDeviceAuth.verify(req, body: req.body.data)
+        let device = try await BusinessDeviceAuth.verify(req)
         let deviceID = try device.requireID()
 
         for _ in 0..<10 {
@@ -167,6 +165,12 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
         guard businessConfiguration.businessSecret != nil else {
             throw Abort(.serviceUnavailable, reason: "business verification is not configured")
         }
+        // Per-IP limits don't stop guessing spread over many addresses, so wrong
+        // PINs also draw from one global budget.
+        let failures = req.application.rateLimits.pinFailures
+        guard await !failures.isExhausted("global") else {
+            throw Abort(.tooManyRequests, reason: "too many wrong PINs, try again shortly")
+        }
         let dto = try req.content.decode(VerifyBusinessPINDTO.self)
         guard dto.pin.utf8.count == 6,
               dto.pin.utf8.allSatisfy({ (48...57).contains($0) }),
@@ -188,6 +192,7 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
               let device = try await BusinessDevice.find(deviceID, on: req.db),
               device.revokedAt == nil,
               let business = try await Business.find(device.businessID, on: req.db) else {
+            await failures.record("global")
             throw Abort(.gone, reason: "verification PIN is invalid, expired, used, or revoked")
         }
         return try BusinessDTO(business)
@@ -197,7 +202,7 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
 
 
     v1.post("devices") { req async throws -> HTTPStatus in
-        let auth = try KenniAuth.verify(req, body: req.body.data)
+        let auth = try await KenniAuth.verify(req)
         let dto = try req.content.decode(DeviceDTO.self)
         // APNs device tokens are hex; reject anything malformed early.
         let token = dto.apnsToken
@@ -220,7 +225,7 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
     // MARK: Call verification relay
 
     v1.post("verify", "requests") { req async throws -> HTTPStatus in
-        let auth = try KenniAuth.verify(req, body: req.body.data)
+        let auth = try await KenniAuth.verify(req)
         let dto = try req.content.decode(VerifyRequestDTO.self)
         guard dto.payload.count < 8192, dto.requestID.count <= 64 else {
             throw Abort(.payloadTooLarge)
@@ -231,6 +236,10 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
         guard let target = try await Device.find(dto.to, on: req.db) else {
             throw Abort(.notFound, reason: "recipient is not reachable")
         }
+        // Anyone holding a public key could otherwise flood its owner with pushes.
+        let limits = req.application.rateLimits
+        try await req.enforce(limits.perRecipient, key: dto.to)
+        try await req.enforce(limits.perPair, key: "\(auth.keyID)>\(dto.to)")
         try await VerificationRequest(
             requestID: dto.requestID, fromKeyID: auth.keyID,
             toKeyID: dto.to, requestPayload: dto.payload
@@ -241,7 +250,7 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
     }
 
     v1.post("verify", "requests", ":id", "response") { req async throws -> HTTPStatus in
-        let auth = try KenniAuth.verify(req, body: req.body.data)
+        let auth = try await KenniAuth.verify(req)
         let id = req.parameters.get("id")!
         let dto = try req.content.decode(VerifyResponseDTO.self)
         guard dto.payload.count < 8192 else { throw Abort(.payloadTooLarge) }
@@ -264,7 +273,7 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
     }
 
     v1.get("verify", "requests", ":id") { req async throws -> VerifyStatusDTO in
-        let auth = try KenniAuth.verify(req, body: req.body.data)
+        let auth = try await KenniAuth.verify(req)
         let id = req.parameters.get("id")!
         guard let request = try await VerificationRequest.find(id, on: req.db),
               request.fromKeyID == auth.keyID || request.toKeyID == auth.keyID else {
@@ -286,7 +295,7 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
     // MARK: Encrypted backup (opt-in, opaque blob)
 
     v1.put("backup") { req async throws -> HTTPStatus in
-        let auth = try KenniAuth.verify(req, body: req.body.data)
+        let auth = try await KenniAuth.verify(req)
         let dto = try req.content.decode(BackupDTO.self)
         guard dto.blob.count < 1_048_576 else { throw Abort(.payloadTooLarge) }
         if let existing = try await BackupBlob.find(auth.keyID, on: req.db) {
@@ -299,7 +308,7 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration,
     }
 
     v1.get("backup") { req async throws -> BackupDTO in
-        let auth = try KenniAuth.verify(req, body: req.body.data)
+        let auth = try await KenniAuth.verify(req)
         guard let backup = try await BackupBlob.find(auth.keyID, on: req.db) else {
             throw Abort(.notFound)
         }

@@ -16,15 +16,26 @@ final class AppTests: XCTestCase {
         app = nil
     }
 
+    static let host = "kenniapi.test"
+
+    static func nonce() -> String {
+        Data((0..<16).map { _ in UInt8.random(in: 0...255) }).base64URLEncodedString()
+    }
+
     /// Signs a request the way the iOS client does.
     private func signedHeaders(method: String, path: String, body: String,
                                key: Curve25519.Signing.PrivateKey) throws -> HTTPHeaders {
         let timestamp = String(Int(Date().timeIntervalSince1970))
-        let message = Data("kenni/v1/api\n\(method)\n\(path)\n\(timestamp)\n\(body)".utf8)
+        let nonce = Self.nonce()
+        let message = SignedRequest.message(
+            context: "api", host: Self.host, method: method, path: path,
+            timestamp: timestamp, nonce: nonce, body: body)
         let signature = try key.signature(for: message)
         var headers = HTTPHeaders()
+        headers.add(name: "Host", value: Self.host)
         headers.add(name: "X-Kenni-Id", value: key.publicKey.rawRepresentation.base64URLEncodedString())
         headers.add(name: "X-Kenni-Timestamp", value: timestamp)
+        headers.add(name: "X-Kenni-Nonce", value: nonce)
         headers.add(name: "X-Kenni-Signature", value: signature.base64URLEncodedString())
         headers.contentType = .json
         return headers
@@ -34,10 +45,14 @@ final class AppTests: XCTestCase {
                                  deviceID: UUID,
                                  key: Curve25519.Signing.PrivateKey) throws -> HTTPHeaders {
         let timestamp = String(Int(Date().timeIntervalSince1970))
-        let message = Data(
-            "kenni/v1/business-device\n\(method)\n\(path)\n\(timestamp)\n\(body)".utf8)
+        let nonce = Self.nonce()
+        let message = SignedRequest.message(
+            context: "business-device", host: Self.host, method: method, path: path,
+            timestamp: timestamp, nonce: nonce, body: body)
         let signature = try key.signature(for: message)
         var headers = HTTPHeaders()
+        headers.add(name: "Host", value: Self.host)
+        headers.add(name: "X-Kenni-Nonce", value: nonce)
         headers.add(name: "X-Kenni-Business-Device", value: deviceID.uuidString)
         headers.add(name: "X-Kenni-Business-Timestamp", value: timestamp)
         headers.add(name: "X-Kenni-Business-Signature",
@@ -80,8 +95,73 @@ final class AppTests: XCTestCase {
         }) { res async in
             XCTAssertEqual(res.status, .unauthorized)
         }
+
+        // The exact same signed request a second time → replay.
+        try await app.test(.POST, "v1/devices", beforeRequest: { req in
+            req.headers = headers
+            req.body = ByteBuffer(string: body)
+        }) { res async in
+            XCTAssertEqual(res.status, .unauthorized)
+            XCTAssertTrue(res.body.string.contains("replayed"))
+        }
+
+        // Signed for another host → unauthorized.
+        var otherHost = try signedHeaders(method: "POST", path: "/v1/devices", body: body, key: key)
+        otherHost.replaceOrAdd(name: "Host", value: "evil.example")
+        try await app.test(.POST, "v1/devices", beforeRequest: { req in
+            req.headers = otherHost
+            req.body = ByteBuffer(string: body)
+        }) { res async in
+            XCTAssertEqual(res.status, .unauthorized)
+        }
     }
 
+    func testLegacySignaturesStillWorkButCannotBeReplayed() async throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let body = #"{"apnsToken":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#
+        let timestamp = String(Int(Date().timeIntervalSince1970))
+        let message = Data("kenni/v1/api\nPOST\n/v1/devices\n\(timestamp)\n\(body)".utf8)
+        var headers = HTTPHeaders()
+        headers.add(name: "X-Kenni-Id", value: key.publicKey.rawRepresentation.base64URLEncodedString())
+        headers.add(name: "X-Kenni-Timestamp", value: timestamp)
+        headers.add(name: "X-Kenni-Signature",
+                    value: try key.signature(for: message).base64URLEncodedString())
+        headers.contentType = .json
+        try await app.test(.POST, "v1/devices", beforeRequest: { req in
+            req.headers = headers
+            req.body = ByteBuffer(string: body)
+        }) { res async in
+            XCTAssertEqual(res.status, .ok)
+        }
+        try await app.test(.POST, "v1/devices", beforeRequest: { req in
+            req.headers = headers
+            req.body = ByteBuffer(string: body)
+        }) { res async in
+            XCTAssertEqual(res.status, .unauthorized)
+        }
+    }
+
+    func testClientIPResolution() throws {
+        func resolve(_ trust: String?, peer: String, forwarded: String?) throws -> String {
+            ClientIPResolver.fromEnvironment(trust)
+                .clientIP(peer: peer, forwardedFor: forwarded.map { [$0] } ?? [])
+        }
+        // Default: the Docker proxy is trusted, client-written entries are not.
+        XCTAssertEqual(try resolve(nil, peer: "172.18.0.2", forwarded: "1.2.3.4"), "1.2.3.4")
+        XCTAssertEqual(try resolve(nil, peer: "172.18.0.2", forwarded: "6.6.6.6, 1.2.3.4"),
+                       "1.2.3.4")
+        // A public peer can't claim to be anyone else.
+        XCTAssertEqual(try resolve(nil, peer: "9.9.9.9", forwarded: "1.2.3.4"), "9.9.9.9")
+        // Two hops (CDN → proxy → app): the address the CDN saw.
+        XCTAssertEqual(try resolve("2", peer: "172.18.0.2",
+                                   forwarded: "6.6.6.6, 1.2.3.4, 104.16.0.1"), "1.2.3.4")
+        // Explicit ranges (proxy + CDN edge).
+        XCTAssertEqual(try resolve("private, 104.16.0.0/13", peer: "172.18.0.2",
+                                   forwarded: "6.6.6.6, 1.2.3.4, 104.16.0.1"), "1.2.3.4")
+        XCTAssertEqual(try resolve("none", peer: "172.18.0.2", forwarded: "1.2.3.4"),
+                       "172.18.0.2")
+        XCTAssertEqual(try resolve(nil, peer: "172.18.0.2", forwarded: "garbage"), "172.18.0.2")
+    }
 
     func testDeviceTokenValidation() async throws {
         let key = Curve25519.Signing.PrivateKey()

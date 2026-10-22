@@ -16,13 +16,16 @@ func configure(_ app: Application, businessConfiguration: BusinessConfiguration)
     // backup blob) to blunt memory-exhaustion attempts.
     app.routes.defaultMaxBodySize = "2mb"
 
-    // Global middleware: security headers + a per-IP rate limit.
+    // Client addresses come from X-Forwarded-For only via trusted proxies
+    // (TRUST_PROXY); see ClientIP.swift.
+    app.clientIPResolver = .fromEnvironment(Environment.get("TRUST_PROXY"))
+    app.acceptsLegacySignatures = Environment.get("ACCEPT_LEGACY_SIGNATURES") != "false"
+    app.rateLimits = .fromEnvironment()
+
+    // Global middleware: metrics, security headers, per-IP rate limit.
+    app.middleware.use(MetricsMiddleware())
     app.middleware.use(SecurityHeadersMiddleware())
-    let rateLimiter = RateLimiterStore(
-        limit: Int(Environment.get("RATE_LIMIT") ?? "120") ?? 120,
-        window: 60)
-    let businessLookupLimiter = RateLimiterStore(limit: 10, window: 60)
-    app.middleware.use(RateLimitMiddleware(store: rateLimiter))
+    app.middleware.use(RateLimitMiddleware(store: app.rateLimits.perIP))
 
     // MARK: Database — Postgres in deployment (Coolify), SQLite for local dev/tests.
     if app.environment == .testing {
@@ -38,6 +41,7 @@ func configure(_ app: Application, businessConfiguration: BusinessConfiguration)
     app.migrations.add(RemoveBusinessPIN())
     app.migrations.add(CreateBusinessDevices())
     app.migrations.add(ReplaceBusinessConfirmationChallengesWithPINs())
+    app.migrations.add(CreateUsedNonces())
     try await app.autoMigrate()
 
     // MARK: APNs — configured only when keys are present, so local dev just logs.
@@ -83,16 +87,14 @@ func configure(_ app: Application, businessConfiguration: BusinessConfiguration)
             // database pool after shutdown has begun.
             guard !Task.isCancelled, let app else { return }
             try? await Cleanup.run(on: app.db, logger: app.logger)
-            await rateLimiter.sweep()
-            await businessLookupLimiter.sweep()
+            for limiter in app.rateLimits.all { await limiter.sweep() }
         }
     }
     app.lifecycle.use(CancelOnShutdown(task: cleanupTask))
 
     app.asyncCommands.use(PushTestCommand(), as: "push-test")
 
-    try routes(app, businessConfiguration: businessConfiguration,
-               businessLookupLimiter: businessLookupLimiter)
+    try routes(app, businessConfiguration: businessConfiguration)
 }
 
 /// Reconstruct a canonical PKCS#8 PEM from a key whose newlines were flattened
@@ -126,6 +128,7 @@ enum Cleanup {
     static func run(on db: any Database, logger: Logger) async throws {
         let now = Date()
         try await VerificationRequest.query(on: db).filter(\.$expiresAt < now).delete()
+        try await UsedNonce.query(on: db).filter(\.$expiresAt < now).delete()
         try await BusinessConfirmation.query(on: db).filter(\.$expiresAt < now).delete()
         try await BusinessDeviceInvitation.query(on: db)
             .filter(\.$expiresAt < now)
