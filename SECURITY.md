@@ -1,60 +1,74 @@
 # Security model
 
-KENNI's backend is a **blind relay**. It is designed so that compromising the
-server does not compromise anyone's identity or let anyone be impersonated.
+KENNI's backend is a **blind relay** plus a small business directory. It is designed
+so that compromising the server does not compromise anyone's identity or let anyone be
+impersonated to their contacts.
 
 ## What the server can and cannot do
 
 - **Cannot** read names, photos, contacts, or message content — profile data
-  never reaches it, and verification payloads are opaque signed envelopes.
+  never reaches it, verification payloads are opaque signed envelopes, and family
+  alerts are encrypted on the phone with the pairwise key.
 - **Cannot** forge a verification: every request/response is signed on-device
   with an Ed25519 key, and verified on the recipient's device against the public
-  key exchanged out-of-band (QR/link). The server holds no signing keys.
+  key exchanged out-of-band (QR/link). The server holds no signing keys. Live
+  Activity updates only say "answered"; the verdict is decided in the app.
 - **Cannot** introduce a contact: identities are exchanged directly between
   users. The server only relays.
-- **Stores** only what routing needs: a public key ↔ APNs token mapping,
-  short-lived signed envelopes (verification requests: 90 s, exchange tokens:
-  7 days), and an optional client-side-encrypted backup blob it cannot read.
+- **Stores** only what routing needs: public key ↔ APNs token registrations,
+  short-lived envelopes (verification requests: 90 s, family alerts: 24 h), an
+  optional client-side-encrypted backup blob it cannot read, and the blocks a key
+  asked for. `DELETE /v1/me` removes all of it.
+- **Business directory:** the server *is* the trust anchor for "this is an approved
+  business". A compromised server or super-admin account could approve a fake
+  business, which is why the admin sign-in needs a second factor and every
+  action is audited.
 
 ## Request authentication
 
 Every authenticated endpoint requires a signature over
-`kenni/v1/api\n{METHOD}\n{path}\n{timestamp}\n{body}` using the caller's Ed25519
-key (`X-Kenni-Id` / `X-Kenni-Timestamp` / `X-Kenni-Signature`). The server
-verifies the signature and a ±300 s timestamp window. This proves key possession
-without any account system.
+
+    kenni/v2/{context}\n{host}\n{METHOD}\n{path}\n{timestamp}\n{nonce}\n{body}
+
+(`context` = `api` or `business-device`) with the caller's Ed25519 key. The server
+checks a ±300 s timestamp window and accepts each `(key, nonce)` once (database
+replay cache), so captured requests can't be replayed — here or, because the host
+is signed, against another instance. App versions ≤ 1.0.2 sign the older v1 format
+without host and nonce; those are replay-cached by signature and can be switched
+off with `ACCEPT_LEGACY_SIGNATURES=false`.
 
 ## Anti-abuse
 
-- Per-IP rate limiting (`RATE_LIMIT`, default 120/min; `/health` exempt).
-- Request-body cap (2 MB) and per-endpoint payload size limits.
-- Input validation: APNs tokens must be hex; exchange bundles must carry the
-  `KENNI1:` prefix and a sane length.
-- 128-bit random exchange tokens, expiring after 7 days; unique request ids
-  reject verification replays; verification requests expire after 90 s.
-- TTL cleanup job purges expired rows.
-- Conservative security headers on every response.
+- Rate limits per client IP (`RATE_LIMIT`), per signing key, per recipient and per
+  sender→recipient pair; family alerts and outbound verifications have their own.
+- Client IPs come from `X-Forwarded-For` only via trusted proxies (`TRUST_PROXY`).
+- Wrong business PINs draw from a global budget (`PIN_FAILURE_BUDGET`), on top of the
+  per-IP limit, so guessing can't be spread across many addresses.
+- Recipients can block a key; blocked senders get the same 404 as an unknown key.
+- Request-body cap (2 MB), per-endpoint payload limits, strict input validation.
+- APNs tokens reported dead by Apple are removed.
+- Conservative security headers on every response; the admin portal has a strict CSP,
+  per-session CSRF tokens and HTTP-only cookies.
 
-## Residual risks (accepted for v1)
+## Residual risks
 
-- **Signature replay window:** a captured signed request could be replayed within
-  the ±300 s timestamp window. Impact is bounded per endpoint — device/backup
-  writes are idempotent, and verification requests are deduplicated by id — and
-  TLS makes capture hard. A per-request nonce cache could close it entirely.
 - **Recipient enumeration:** `POST /v1/verify/requests` returns 404 for an
-  unregistered target, which reveals whether a given public key is registered.
+  unregistered (or blocking) target, which reveals whether a key is registered.
   Keys are exchanged privately, so exposure is limited.
-- **Signatures are not domain-bound:** a signature is valid against any KENNI
-  API instance. Harmless with a single canonical instance; bind an audience if
-  you run several.
-- **In-memory rate limiter** is per-instance (see Deployment notes).
+- **Business PIN relay:** a scammer who gets a real PIN from a business during a
+  parallel call can pass it on within 90 s. The customer sees the representative's
+  name and the app asks them to only trust PINs from a call *they* placed;
+  outbound verifications (business → customer's KENNI ID) avoid the problem for
+  calls the business makes.
+- **In-memory rate limiter** is per instance (see README).
 
 ## Deployment notes
 
 - Never commit the APNs `.p8`; provide it via `APNS_KEY_P8` (or a mounted file
   referenced by `APNS_KEY_PATH`). Both are gitignored.
-- The in-memory rate limiter is per-instance. Behind multiple replicas, add a
-  shared limiter or edge protection (e.g. Cloudflare).
+- Keep `BUSINESS_TOKEN_SECRET` stable and secret: rotating it invalidates
+  enrollment links, PINs and stored SSO client secrets.
+- Set `ADMIN_TOTP_SECRET`; the API logs a warning without it.
 - Run behind TLS (Coolify/Traefik terminate it at `kenniapi.benavo.ch`).
 
 ## Reporting

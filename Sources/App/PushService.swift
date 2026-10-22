@@ -153,6 +153,32 @@ enum PushService {
         (environment ?? defaultEnvironment) == "production" ? .production : .development
     }
 
+    /// Mirrors the app's `CheckActivityAttributes.ContentState`.
+    struct CheckActivityState: Codable {
+        let phase: String
+    }
+
+    /// Flips the requester's lock-screen countdown to "answered" — the verdict
+    /// itself is only ever decided in the app, after checking the signature.
+    static func updateCheckActivity(token: String, environment: String?, phase: String,
+                                    on req: Request) async {
+        let container = environmentID(environment)
+        guard req.application.apns.containers.container(for: container) != nil else { return }
+        let notification = APNSLiveActivityNotification(
+            expiration: .timeIntervalSince1970InSeconds(Int(Date().timeIntervalSince1970) + 120),
+            priority: .immediately,
+            appID: appTopic,
+            contentState: CheckActivityState(phase: phase),
+            event: .update,
+            timestamp: Int(Date().timeIntervalSince1970))
+        do {
+            try await req.application.apns.client(container)
+                .sendLiveActivityNotification(notification, deviceToken: token)
+        } catch {
+            req.logger.info("live activity update failed: \(error)")
+        }
+    }
+
     static func sendBusinessRevocation(to device: BusinessDevice, on req: Request) async {
         guard let token = device.apnsToken else { return }
         let target = Target(token: token, environment: device.apnsEnvironment) { environment in

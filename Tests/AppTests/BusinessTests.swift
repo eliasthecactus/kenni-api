@@ -336,4 +336,23 @@ final class BusinessTests: XCTestCase {
             XCTAssertEqual(res.status, .notFound)
         }
     }
+
+    func testFamilyAlertOnlyReachesTheRecipient() async throws {
+        let mum = Curve25519.Signing.PrivateKey()
+        let son = Curve25519.Signing.PrivateKey()
+        let sonID = son.publicKey.rawRepresentation.base64URLEncodedString()
+        _ = try await personal(.POST, "/v1/devices",
+                               body: #"{"apnsToken":"\#(String(repeating: "e", count: 64))"}"#,
+                               key: son)
+        let alertID = UUID()
+        let (sent, _) = try await personal(
+            .POST, "/v1/alerts",
+            body: #"{"alertID":"\#(alertID)","to":"\#(sonID)","payload":"sealed"}"#, key: mum)
+        XCTAssertEqual(sent, .created)
+        let (hidden, _) = try await personal(.GET, "/v1/alerts/\(alertID)", key: mum)
+        XCTAssertEqual(hidden, .notFound)
+        let (read, body) = try await personal(.GET, "/v1/alerts/\(alertID)", key: son)
+        XCTAssertEqual(read, .ok)
+        XCTAssertEqual(try JSONDecoder().decode(FamilyAlertDTO.self, from: body).payload, "sealed")
+    }
 }

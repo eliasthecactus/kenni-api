@@ -39,6 +39,9 @@ final class VerificationRequest: Model, @unchecked Sendable {
     @Field(key: "to_key_id") var toKeyID: String
     @Field(key: "request_payload") var requestPayload: String
     @OptionalField(key: "response_payload") var responsePayload: String?
+    /// The requester's Live Activity push token, to show "answered" on the lock screen.
+    @OptionalField(key: "activity_token") var activityToken: String?
+    @OptionalField(key: "activity_environment") var activityEnvironment: String?
     @Field(key: "expires_at") var expiresAt: Date
     @Timestamp(key: "created_at", on: .create) var createdAt: Date?
 

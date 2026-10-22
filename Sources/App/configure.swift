@@ -48,6 +48,7 @@ func configure(_ app: Application, businessConfiguration: BusinessConfiguration)
     app.migrations.add(AddBusinessDeviceAPNSEnvironment())
     app.migrations.add(ExtendBusinessAdministration())
     app.migrations.add(CreateAdministration())
+    app.migrations.add(CreateFamilyAlertsAndActivities())
     // Single instance: migrate on boot. Several replicas: set AUTO_MIGRATE=false
     // and run `App migrate --yes` once per deploy instead.
     if Environment.get("AUTO_MIGRATE") != "false" {
@@ -158,6 +159,7 @@ enum Cleanup {
         let now = Date()
         try await VerificationRequest.query(on: db).filter(\.$expiresAt < now).delete()
         try await UsedNonce.query(on: db).filter(\.$expiresAt < now).delete()
+        try await FamilyAlert.query(on: db).filter(\.$expiresAt < now).delete()
         try await OIDCLoginState.query(on: db).filter(\.$expiresAt < now).delete()
         try await AdminSession.query(on: db).filter(\.$expiresAt < now).delete()
         // Outbound verifications stay a day so the business can still see the answer.

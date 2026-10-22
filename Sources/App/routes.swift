@@ -7,5 +7,6 @@ func routes(_ app: Application, businessConfiguration: BusinessConfiguration) th
 
     let v1 = app.grouped("v1")
     registerPersonalRoutes(on: v1)
+    registerFamilyAlertRoutes(on: v1)
     registerBusinessRoutes(on: v1, app: app, businessConfiguration: businessConfiguration)
 }

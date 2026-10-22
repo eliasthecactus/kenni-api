@@ -1,0 +1,17 @@
+name: Test
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: swift:6.2-noble
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve
+        run: swift package resolve
+      - name: Test
+        run: swift test

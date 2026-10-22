@@ -16,6 +16,9 @@ struct VerifyRequestDTO: Content {
     let requestID: String
     let to: String       // target key id (base64url pubkey)
     let payload: String  // opaque signed envelope, verified on the phones
+    /// Optional Live Activity push token of the requester's countdown.
+    let activityToken: String?
+    let activityEnvironment: String?
 }
 
 struct VerifyResponseDTO: Content {
@@ -97,7 +100,9 @@ func registerPersonalRoutes(on v1: any RoutesBuilder) {
             try await VerificationRequest.query(on: db).group(.or) {
                 $0.filter(\.$fromKeyID == auth.keyID).filter(\.$toKeyID == auth.keyID)
             }.delete()
-            try await deletePersonalExtras(keyID: auth.keyID, on: db)
+            try await FamilyAlert.query(on: db).group(.or) {
+                $0.filter(\.$fromKeyID == auth.keyID).filter(\.$toKeyID == auth.keyID)
+            }.delete()
         }
         return .noContent
     }
@@ -151,10 +156,15 @@ func registerPersonalRoutes(on v1: any RoutesBuilder) {
         try await req.enforce(limits.perRecipient, key: dto.to)
         try await req.enforce(limits.perPair, key: "\(auth.keyID)>\(dto.to)")
 
-        try await VerificationRequest(
+        let request = VerificationRequest(
             requestID: dto.requestID, fromKeyID: auth.keyID,
-            toKeyID: dto.to, requestPayload: dto.payload
-        ).create(on: req.db)
+            toKeyID: dto.to, requestPayload: dto.payload)
+        if let token = dto.activityToken?.lowercased(), (32...512).contains(token.count),
+           token.allSatisfy(\.isHexDigit) {
+            request.activityToken = token
+            request.activityEnvironment = dto.activityEnvironment
+        }
+        try await request.create(on: req.db)
         await req.application.metrics.increment("kenni_verifications_created_total")
         await PushService.send(.request, id: dto.requestID,
                                to: PushService.targets(for: targets, on: req.db), on: req)
@@ -181,7 +191,11 @@ func registerPersonalRoutes(on v1: any RoutesBuilder) {
             .filter(\.$keyID == request.fromKeyID).all()
         await PushService.send(.response, id: id,
                                to: PushService.targets(for: origins, on: req.db), on: req)
-        try await afterVerificationAnswered(request, on: req)
+        if let token = request.activityToken {
+            await PushService.updateCheckActivity(token: token,
+                                                  environment: request.activityEnvironment,
+                                                  phase: "answered", on: req)
+        }
         return .ok
     }
 
@@ -234,9 +248,3 @@ func registerPersonalRoutes(on v1: any RoutesBuilder) {
         return .noContent
     }
 }
-
-/// Rows added by later features that belong to a personal key.
-func deletePersonalExtras(keyID: String, on db: any Database) async throws {}
-
-/// Hook for work that follows an answered verification (Live Activity updates).
-func afterVerificationAnswered(_ request: VerificationRequest, on req: Request) async throws {}
