@@ -95,6 +95,7 @@ final class BusinessDevice: Model, @unchecked Sendable {
     @Field(key: "device_label") var deviceLabel: String
     @Field(key: "public_key") var publicKey: String
     @OptionalField(key: "apns_token") var apnsToken: String?
+    @OptionalField(key: "apns_environment") var apnsEnvironment: String?
     @Timestamp(key: "enrolled_at", on: .create) var enrolledAt: Date?
     @OptionalField(key: "last_seen_at") var lastSeenAt: Date?
     @OptionalField(key: "revoked_at") var revokedAt: Date?
@@ -253,6 +254,20 @@ struct ReplaceBusinessConfirmationChallengesWithPINs: AsyncMigration {
     }
 }
 
+struct AddBusinessDeviceAPNSEnvironment: AsyncMigration {
+    func prepare(on database: any Database) async throws {
+        try await database.schema(BusinessDevice.schema)
+            .field("apns_environment", .string)
+            .update()
+    }
+
+    func revert(on database: any Database) async throws {
+        try await database.schema(BusinessDevice.schema)
+            .deleteField("apns_environment")
+            .update()
+    }
+}
+
 struct BusinessDTO: Content, Equatable {
     let id: UUID
     let name: String
@@ -291,6 +306,7 @@ struct BusinessDeviceStatusDTO: Content {
 
 struct BusinessDeviceAPNSDTO: Content {
     let apnsToken: String
+    let apnsEnvironment: String?
 }
 
 struct BusinessPINDTO: Content {

@@ -42,6 +42,9 @@ func configure(_ app: Application, businessConfiguration: BusinessConfiguration)
     app.migrations.add(CreateBusinessDevices())
     app.migrations.add(ReplaceBusinessConfirmationChallengesWithPINs())
     app.migrations.add(CreateUsedNonces())
+    app.migrations.add(CreateDeviceRegistrations())
+    app.migrations.add(IndexDeviceRegistrations())
+    app.migrations.add(AddBusinessDeviceAPNSEnvironment())
     try await app.autoMigrate()
 
     // MARK: APNs — configured only when keys are present, so local dev just logs.
@@ -57,19 +60,24 @@ func configure(_ app: Application, businessConfiguration: BusinessConfiguration)
             // collapse to spaces or literal "\n". Rebuild a canonical PEM so
             // CryptoKit can parse it however the newlines survived.
             let privateKey = try P256.Signing.PrivateKey(pemRepresentation: normalizePEM(rawP8))
-            let apnsConfig = APNSClientConfiguration(
-                authenticationMethod: .jwt(
-                    privateKey: privateKey,
-                    keyIdentifier: keyID,
-                    teamIdentifier: teamID),
-                environment: Environment.get("APNS_ENV") == "production" ? .production : .development)
-            app.apns.containers.use(
-                apnsConfig,
-                eventLoopGroupProvider: .shared(app.eventLoopGroup),
-                responseDecoder: JSONDecoder(),
-                requestEncoder: JSONEncoder(),
-                as: .default)
-            app.logger.info("APNs configured (\(Environment.get("APNS_ENV") ?? "development"))")
+            // Both endpoints: Xcode/ad-hoc builds hold sandbox tokens, TestFlight and
+            // App Store builds production ones. Each registration says which.
+            for (id, environment) in [(APNSContainers.ID.production, APNSEnvironment.production),
+                                      (.development, .development)] {
+                app.apns.containers.use(
+                    APNSClientConfiguration(
+                        authenticationMethod: .jwt(
+                            privateKey: privateKey,
+                            keyIdentifier: keyID,
+                            teamIdentifier: teamID),
+                        environment: environment),
+                    eventLoopGroupProvider: .shared(app.eventLoopGroup),
+                    responseDecoder: JSONDecoder(),
+                    requestEncoder: JSONEncoder(),
+                    as: id,
+                    isDefault: PushService.environmentID(nil) == id)
+            }
+            app.logger.info("APNs configured (default for unlabeled tokens: \(PushService.defaultEnvironment))")
         } catch {
             // A malformed key must not take the whole server down — degrade to
             // log-only pushes, exactly like the unconfigured case.

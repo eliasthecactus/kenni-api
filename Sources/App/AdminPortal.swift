@@ -134,9 +134,7 @@ func registerAdminPortal(on app: Application, configuration: BusinessConfigurati
         if device.revokedAt == nil {
             device.revokedAt = .now
             try await device.save(on: req.db)
-            if let token = device.apnsToken {
-                await PushService.sendBusinessRevocation(toDeviceToken: token, on: req)
-            }
+            await PushService.sendBusinessRevocation(to: device, on: req)
         }
         return redirectToAdmin()
     }

@@ -1,5 +1,6 @@
 import XCTVapor
 import Crypto
+import Fluent
 @testable import App
 
 final class AppTests: XCTestCase {
@@ -161,6 +162,91 @@ final class AppTests: XCTestCase {
         XCTAssertEqual(try resolve("none", peer: "172.18.0.2", forwarded: "1.2.3.4"),
                        "172.18.0.2")
         XCTAssertEqual(try resolve(nil, peer: "172.18.0.2", forwarded: "garbage"), "172.18.0.2")
+    }
+
+    /// Sends a signed JSON request and returns status + body.
+    @discardableResult
+    func signed(_ method: HTTPMethod, _ path: String, body: String = "",
+                key: Curve25519.Signing.PrivateKey) async throws -> (HTTPStatus, String) {
+        var result: (HTTPStatus, String) = (.internalServerError, "")
+        try await app.test(method, String(path.dropFirst()), beforeRequest: { req in
+            req.headers = try self.signedHeaders(method: method.rawValue, path: path,
+                                                 body: body, key: key)
+            if !body.isEmpty { req.body = ByteBuffer(string: body) }
+        }) { res async in
+            result = (res.status, res.body.string)
+        }
+        return result
+    }
+
+    static func token(_ seed: Character) -> String { String(repeating: seed, count: 64) }
+
+    func testMultipleDevicesDeletionAndBlocks() async throws {
+        let alice = Curve25519.Signing.PrivateKey()
+        let bob = Curve25519.Signing.PrivateKey()
+        let bobID = bob.publicKey.rawRepresentation.base64URLEncodedString()
+        let aliceID = alice.publicKey.rawRepresentation.base64URLEncodedString()
+
+        // Bob's iPhone and iPad.
+        for seed in ["a", "b"] as [Character] {
+            let (status, _) = try await signed(.POST, "/v1/devices", body:
+                #"{"apnsToken":"\#(Self.token(seed))","apnsEnvironment":"production"}"#, key: bob)
+            XCTAssertEqual(status, .ok)
+        }
+        var bobDevices = try await DeviceRegistration.query(on: app.db)
+            .filter(\.$keyID == bobID).count()
+        XCTAssertEqual(bobDevices, 2)
+        let registration = try await DeviceRegistration.query(on: app.db).first()
+        XCTAssertEqual(registration?.customerID.count, 12)
+
+        // The iPad switches to another identity: its token moves.
+        let other = Curve25519.Signing.PrivateKey()
+        try await signed(.POST, "/v1/devices",
+                         body: #"{"apnsToken":"\#(Self.token("b"))"}"#, key: other)
+        bobDevices = try await DeviceRegistration.query(on: app.db)
+            .filter(\.$keyID == bobID).count()
+        XCTAssertEqual(bobDevices, 1)
+
+        // Bob blocks Alice: her request looks exactly like an unknown recipient.
+        let (blocked, _) = try await signed(.POST, "/v1/blocks",
+                                            body: #"{"key":"\#(aliceID)"}"#, key: bob)
+        XCTAssertEqual(blocked, .ok)
+        let request = #"{"requestID":"\#(UUID().uuidString)","to":"\#(bobID)","payload":"x"}"#
+        let (refused, _) = try await signed(.POST, "/v1/verify/requests", body: request, key: alice)
+        XCTAssertEqual(refused, .notFound)
+        try await signed(.DELETE, "/v1/blocks/\(aliceID)", key: bob)
+        let (accepted, _) = try await signed(
+            .POST, "/v1/verify/requests",
+            body: #"{"requestID":"\#(UUID().uuidString)","to":"\#(bobID)","payload":"x"}"#,
+            key: alice)
+        XCTAssertEqual(accepted, .created)
+
+        // Bob erases everything.
+        try await signed(.PUT, "/v1/backup", body: #"{"blob":"b"}"#, key: bob)
+        let (erased, _) = try await signed(.DELETE, "/v1/me", key: bob)
+        XCTAssertEqual(erased, .noContent)
+        bobDevices = try await DeviceRegistration.query(on: app.db)
+            .filter(\.$keyID == bobID).count()
+        XCTAssertEqual(bobDevices, 0)
+        let backups = try await BackupBlob.query(on: app.db).count()
+        XCTAssertEqual(backups, 0)
+        let pending = try await VerificationRequest.query(on: app.db).count()
+        XCTAssertEqual(pending, 0)
+    }
+
+    func testRecipientRateLimit() async throws {
+        let bob = Curve25519.Signing.PrivateKey()
+        let bobID = bob.publicKey.rawRepresentation.base64URLEncodedString()
+        try await signed(.POST, "/v1/devices",
+                         body: #"{"apnsToken":"\#(Self.token("c"))"}"#, key: bob)
+        let alice = Curve25519.Signing.PrivateKey()
+        var statuses: [HTTPStatus] = []
+        for _ in 0..<5 {
+            let body = #"{"requestID":"\#(UUID().uuidString)","to":"\#(bobID)","payload":"x"}"#
+            statuses.append(try await signed(.POST, "/v1/verify/requests", body: body, key: alice).0)
+        }
+        XCTAssertEqual(statuses.filter { $0 == .created }.count, 4)
+        XCTAssertEqual(statuses.last, .tooManyRequests)
     }
 
     func testDeviceTokenValidation() async throws {
