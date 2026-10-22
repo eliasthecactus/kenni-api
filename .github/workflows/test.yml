@@ -5,13 +5,29 @@ on:
     branches: [main, dev]
   pull_request:
 
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
-    container: swift:6.2-noble
+    container: swift:6.4-noble # same toolchain as the Dockerfile
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-${{ hashFiles('Package.resolved') }}
       - name: Resolve
         run: swift package resolve
       - name: Test
         run: swift test
+
+  docker:
+    name: Docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build image
+        run: docker build -t kenni-api:ci .

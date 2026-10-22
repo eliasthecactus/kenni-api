@@ -72,7 +72,7 @@ func configure(_ app: Application, businessConfiguration: BusinessConfiguration)
             // App Store builds production ones. Each registration says which.
             for (id, environment) in [(APNSContainers.ID.production, APNSEnvironment.production),
                                       (.development, .development)] {
-                app.apns.containers.use(
+                await app.apns.containers.use(
                     APNSClientConfiguration(
                         authenticationMethod: .jwt(
                             privateKey: privateKey,

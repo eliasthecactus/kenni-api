@@ -15,7 +15,7 @@ struct PushTestCommand: AsyncCommand {
 
     func run(using context: CommandContext, signature: Signature) async throws {
         let app = context.application
-        guard app.apns.containers.container() != nil else {
+        guard await app.apns.containers.container() != nil else {
             context.console.error("APNs is not configured — set APNS_KEY_PATH/APNS_KEY_P8, APNS_KEY_ID, APNS_TEAM_ID")
             return
         }

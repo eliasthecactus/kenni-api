@@ -94,7 +94,7 @@ enum PushService {
 
     static func send(_ kind: Kind, id: String, to target: Target, on req: Request) async {
         let primary = environmentID(target.environment)
-        guard req.application.apns.containers.container(for: primary) != nil else {
+        guard await req.application.apns.containers.container(for: primary) != nil else {
             req.logger.info("push skipped (APNs not configured): \(kind.rawValue) \(id)")
             return
         }
@@ -120,7 +120,7 @@ enum PushService {
         } catch let error as APNSError where error.reason == .badDeviceToken {
             // Usually a sandbox token sent to production (or the reverse).
             let fallback: APNSContainers.ID = primary == .production ? .development : .production
-            guard req.application.apns.containers.container(for: fallback) != nil else {
+            guard await req.application.apns.containers.container(for: fallback) != nil else {
                 try? await target.update(nil)
                 return
             }
@@ -163,7 +163,7 @@ enum PushService {
     static func updateCheckActivity(token: String, environment: String?, phase: String,
                                     on req: Request) async {
         let container = environmentID(environment)
-        guard req.application.apns.containers.container(for: container) != nil else { return }
+        guard await req.application.apns.containers.container(for: container) != nil else { return }
         let notification = APNSLiveActivityNotification(
             expiration: .timeIntervalSince1970InSeconds(Int(Date().timeIntervalSince1970) + 120),
             priority: .immediately,
