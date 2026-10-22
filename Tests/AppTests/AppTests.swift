@@ -151,6 +151,15 @@ final class AppTests: XCTestCase {
         XCTAssertEqual(try resolve(nil, peer: "172.18.0.2", forwarded: "1.2.3.4"), "1.2.3.4")
         XCTAssertEqual(try resolve(nil, peer: "172.18.0.2", forwarded: "6.6.6.6, 1.2.3.4"),
                        "1.2.3.4")
+        // Opt-in Cloudflare ranges: the address Cloudflare saw, not its edge.
+        let behindCloudflare = "loopback, private, cloudflare"
+        XCTAssertEqual(try resolve(behindCloudflare, peer: "172.18.0.2",
+                                   forwarded: "6.6.6.6, 1.2.3.4, 104.16.0.1"), "1.2.3.4")
+        XCTAssertEqual(try resolve(behindCloudflare, peer: "172.18.0.2",
+                                   forwarded: "2001:db8::7, 2606:4700::6810:1"), "2001:db8::7")
+        // Bypassing Cloudflare: a forged edge entry left of the real peer is never reached.
+        XCTAssertEqual(try resolve(behindCloudflare, peer: "172.18.0.2",
+                                   forwarded: "1.1.1.1, 104.16.0.1, 9.9.9.9"), "9.9.9.9")
         // A public peer can't claim to be anyone else.
         XCTAssertEqual(try resolve(nil, peer: "9.9.9.9", forwarded: "1.2.3.4"), "9.9.9.9")
         // Two hops (CDN → proxy → app): the address the CDN saw.
