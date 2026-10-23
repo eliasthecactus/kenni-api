@@ -15,7 +15,7 @@ jobs:
     container: swift:6.4-noble # same toolchain as the Dockerfile
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: .build
           key: spm-${{ hashFiles('Package.resolved') }}
