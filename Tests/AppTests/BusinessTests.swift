@@ -154,6 +154,27 @@ final class BusinessTests: XCTestCase {
         XCTAssertEqual(replayed, .forbidden)
     }
 
+    func testAdminLoginWithoutTOTPSecretNeedsOnlyTheKey() async throws {
+        let plain = try await Application.make(.testing)
+        try await configure(plain, businessConfiguration: BusinessConfiguration(
+            adminPSK: "test-admin-key", businessSecret: "test-business-token-secret"))
+        do {
+            try await plain.test(.GET, "admin") { res async in
+                XCTAssertTrue(res.body.string.contains("name=\"psk\""))
+                XCTAssertFalse(res.body.string.contains("name=\"totp\""))
+            }
+            try await plain.test(.POST, "admin/login", beforeRequest: { req in
+                req.headers.replaceOrAdd(name: "Content-Type",
+                                         value: "application/x-www-form-urlencoded")
+                req.body = ByteBuffer(string: "psk=test-admin-key")
+            }) { res async in XCTAssertEqual(res.status, .seeOther) }
+        } catch {
+            try await plain.asyncShutdown()
+            throw error
+        }
+        try await plain.asyncShutdown()
+    }
+
     func testLogoutRevokesTheSession() async throws {
         let (cookie, csrf) = try await adminSession(role: .superAdmin)
         try await app.test(.GET, "admin", beforeRequest: { req in

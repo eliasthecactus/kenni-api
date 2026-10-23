@@ -46,8 +46,9 @@ nonce, and each one is accepted once. See `KenniAuth.swift`.
 
 ## Administration
 
-- **KENNI super admins** sign in at `/admin` with `ADMIN_PSK` plus a TOTP code
-  (`ADMIN_TOTP_SECRET`, generate with `swift run App admin-totp-secret`). They approve,
+- **KENNI super admins** sign in at `/admin` with `ADMIN_PSK`. If `ADMIN_TOTP_SECRET` is
+  set, they also need an authenticator code (generate the secret with
+  `swift run App admin-totp-secret`, anywhere — it is just a random value). They approve,
   edit, suspend and delete businesses, upload logos and set up company sign-in.
 - **Business admins** sign in with their company's OpenID Connect provider (Entra ID,
   Google Workspace, Okta, …) via their organisation ID, and manage only their own
@@ -64,18 +65,21 @@ Rate limits key on the client IP, which only trusted proxies may report through
 `X-Forwarded-For` (`TRUST_PROXY`, see `.env.example`). The default trusts loopback and
 private networks, which is right when Coolify's Traefik is the only proxy.
 
-**With a CDN or second proxy in front of Traefik** (e.g. Cloudflare), two things are needed:
+**With a CDN or second proxy in front of Traefik** (Cloudflare or any other), two things
+are needed:
 
-1. Traefik must keep the CDN's `X-Forwarded-For` instead of replacing it. In Coolify →
-   *Servers* → your server → *Proxy*, add to the Traefik `command:` list (both
-   entrypoints), using your CDN's published IP ranges:
+1. Traefik must keep the CDN's `X-Forwarded-For` instead of replacing it. This is a
+   Traefik *entrypoint* setting, so it can't go into the service's labels. In Coolify →
+   *Servers* → your server → *Proxy*, add to the Traefik `command:` list:
    ```yaml
-   - '--entrypoints.http.forwardedHeaders.trustedIPs=<CDN ranges, comma-separated>'
-   - '--entrypoints.https.forwardedHeaders.trustedIPs=<CDN ranges, comma-separated>'
+   - '--entrypoints.http.forwardedHeaders.insecure=true'
+   - '--entrypoints.https.forwardedHeaders.insecure=true'
    ```
-   then restart the proxy.
-2. On the kenni-api service set `TRUST_PROXY=2` (CDN + Traefik), or list the CDN ranges
-   explicitly: `TRUST_PROXY=private,<CDN ranges>`.
+   then restart the proxy. This works with any CDN. The trade-off: a client that reaches
+   the server directly, bypassing the CDN, can choose the address the per-IP limit sees.
+   The per-key, per-recipient and global PIN limits still apply. For a strict setup, use
+   `forwardedHeaders.trustedIPs=<CDN ranges>` instead of `insecure=true`.
+2. On the kenni-api service set `TRUST_PROXY=2` (CDN + Traefik).
 
 Signed requests are also limited per key (offices behind one NAT don't share a budget),
 recipients per sender, and wrong business PINs draw from a global budget. The limiter is

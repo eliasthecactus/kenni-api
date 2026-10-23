@@ -68,7 +68,8 @@ off with `ACCEPT_LEGACY_SIGNATURES=false`.
   referenced by `APNS_KEY_PATH`). Both are gitignored.
 - Keep `BUSINESS_TOKEN_SECRET` stable and secret: rotating it invalidates
   enrollment links, PINs and stored SSO client secrets.
-- Set `ADMIN_TOTP_SECRET`; the API logs a warning without it.
+- Optionally set `ADMIN_TOTP_SECRET` for a second factor; without it the sign-in needs
+  only `ADMIN_PSK` and the API logs a warning at startup.
 - Run behind TLS (Coolify/Traefik terminate it at `kenniapi.benavo.ch`).
 
 ## Reporting
